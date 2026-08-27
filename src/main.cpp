@@ -227,6 +227,17 @@ public:
   }
 
   void IRAM_ATTR handleEdge() {
+    uint32_t now = micros();
+
+    if ((_byteIndex != 0 || _bitCount != 0) &&
+        (now - _lastEdgeUs) > kFrameGapTimeoutUs) {
+      _shiftByte = 0;
+      _bitCount = 0;
+      _byteIndex = 0;
+    }
+    _lastEdgeUs = now;
+    _edgeCount = _edgeCount + 1;
+
     uint8_t bit = static_cast<uint8_t>(digitalRead(_dataPin));
     _shiftByte |= static_cast<uint8_t>(bit << _bitCount);
     _bitCount = _bitCount + 1;
@@ -250,6 +261,8 @@ public:
     }
   }
 
+  uint32_t edgeCount() const { return _edgeCount; }
+
 private:
   uint8_t _clkPin;
   uint8_t _dataPin;
@@ -260,6 +273,10 @@ private:
   volatile uint8_t _byteIndex = 0;
   volatile uint8_t _frame[4] = {0, 0, 0, 0};
   volatile bool _frameReady = false;
+
+  volatile uint32_t _lastEdgeUs = 0;
+  volatile uint32_t _edgeCount = 0;
+  static constexpr uint32_t kFrameGapTimeoutUs = 1500;
 };
 
 ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
@@ -273,6 +290,13 @@ bool initSD() {
   return SD.begin(Pins::SD_CS);
 }
 
+void pulseClickWheelReset() {
+  digitalWrite(Pins::CLICK_RESET, LOW);
+  delay(20);
+  digitalWrite(Pins::CLICK_RESET, HIGH);
+  delay(50);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -282,10 +306,7 @@ void setup() {
   Audio::audio_info_callback = audioInfoCallback;
 
   pinMode(Pins::CLICK_RESET, OUTPUT);
-  digitalWrite(Pins::CLICK_RESET, LOW);
-  delay(20);
-  digitalWrite(Pins::CLICK_RESET, HIGH);
-  delay(50);
+  pulseClickWheelReset();
   pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
 
   if (initSD()) {
@@ -345,6 +366,17 @@ void loop() {
 
   bt.update();
   wheel.update(true);
+
+  static unsigned long lastWheelDiag = 0;
+  static uint32_t lastDiagEdgeCount = 0;
+  if (millis() - lastWheelDiag > 2000) {
+    lastWheelDiag = millis();
+    uint32_t edgesNow = wheel.edgeCount();
+    Serial.printf("[Wheel] diag: %lu total edges (+%lu since last check) | WAKE=%d\n",
+                  (unsigned long)edgesNow, (unsigned long)(edgesNow - lastDiagEdgeCount),
+                  digitalRead(Pins::CLICK_WAKE));
+    lastDiagEdgeCount = edgesNow;
+  }
 
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
