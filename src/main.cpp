@@ -23,8 +23,20 @@ namespace Pins {
   constexpr uint8_t CLICK_WAKE  = 18;
   constexpr uint8_t CLICK_RESET = 21;
 }
-Audio audio;
 
+Audio audio;
+volatile bool shouldRepeatTrack = false;
+
+void audioInfoCallback(Audio::msg_t m) {
+  if (m.s && m.msg) {
+    Serial.printf("[Audio %s] %s\n", m.s, m.msg);
+  }
+  
+  if (m.e == Audio::evt_eof) {
+    Serial.println("[Audio] EOF event detected!");
+    shouldRepeatTrack = true;
+  }
+}
 
 struct BtDevice {
   String name;
@@ -161,6 +173,12 @@ public:
   struct State {
     bool touching;
     uint8_t position;
+    uint8_t buttons;
+    bool btnCenter;
+    bool btnRight;
+    bool btnLeft;
+    bool btnDown;
+    bool btnUp;
     uint8_t statusByte;
   };
 
@@ -195,8 +213,14 @@ public:
     }
 
     State state;
-    state.position = frame[2];
-    state.touching = (frame[3] & 0x40) != 0;
+    state.buttons    = frame[1];
+    state.btnCenter  = (frame[1] & 0x01) != 0;
+    state.btnRight   = (frame[1] & 0x02) != 0;
+    state.btnLeft    = (frame[1] & 0x04) != 0;
+    state.btnDown    = (frame[1] & 0x08) != 0;
+    state.btnUp      = (frame[1] & 0x10) != 0;
+    state.position   = frame[2];
+    state.touching   = (frame[3] & 0x40) != 0;
     state.statusByte = frame[3];
 
     if (_onReport) _onReport(state);
@@ -205,7 +229,7 @@ public:
   void IRAM_ATTR handleEdge() {
     uint8_t bit = static_cast<uint8_t>(digitalRead(_dataPin));
     _shiftByte |= static_cast<uint8_t>(bit << _bitCount);
-    ++_bitCount;
+    _bitCount = _bitCount + 1;
 
     if (_bitCount < 8) return;
 
@@ -216,7 +240,7 @@ public:
     }
 
     _frame[_byteIndex] = _shiftByte;
-    ++_byteIndex;
+    _byteIndex = _byteIndex + 1;
     _shiftByte = 0;
     _bitCount = 0;
 
@@ -255,6 +279,15 @@ void setup() {
 
   Serial.println("\n=== System Starting ===");
 
+  Audio::audio_info_callback = audioInfoCallback;
+
+  pinMode(Pins::CLICK_RESET, OUTPUT);
+  digitalWrite(Pins::CLICK_RESET, LOW);
+  delay(20);
+  digitalWrite(Pins::CLICK_RESET, HIGH);
+  delay(50);
+  pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
+
   if (initSD()) {
     Serial.println("[SD] Initialized successfully.");
   } else {
@@ -285,15 +318,15 @@ void setup() {
   Serial.println("[BT] Starting clean scan...");
   bt.startScan(true);
 
-  pinMode(Pins::CLICK_RESET, OUTPUT);
-  digitalWrite(Pins::CLICK_RESET, HIGH);
-  pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
-
   wheel.onReport([](const ClickWheel::State& state) {
-    Serial.printf("[Wheel] %s pos=%u (byte4=%02X)\n",
-                  state.touching ? "TOUCH" : "FREE",
+    Serial.printf("[Wheel] %s pos=%3u | Buttons [Center:%d Menu:%d Play:%d Next:%d Prev:%d]\n",
+                  state.touching ? "TOUCH" : "FREE ",
                   state.position,
-                  state.statusByte);
+                  state.btnCenter,
+                  state.btnUp,
+                  state.btnDown,
+                  state.btnRight,
+                  state.btnLeft);
   });
 
   wheel.begin(clickWheelISR);
@@ -302,7 +335,14 @@ void setup() {
 
 void loop() {
   audio.loop();
-  //copier.copy();
+  vTaskDelay(1);
+
+  if (shouldRepeatTrack) {
+    shouldRepeatTrack = false;
+    Serial.println("[Audio] Restarting track...");
+    audio.connecttoFS(SD, "/sample-15s.mp3");
+  }
+
   bt.update();
   wheel.update(true);
 
@@ -311,12 +351,4 @@ void loop() {
     cmd.trim();
     if (cmd.length() > 0) bt.sendCommand(cmd);
   }
-}
-
-
-void audio_eof_mp3(const char *info) {
-  Serial.print("Track ended: ");
-  Serial.println(info);
-  
-  audio.connecttoFS(SD, "/sample-15s.mp3");
 }
