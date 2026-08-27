@@ -3,7 +3,7 @@
 #include <vector>
 #include <functional>
 #include "Arduino.h"
-#include "AudioTools.h"
+#include "Audio.h"
 
 namespace Pins {
   constexpr uint8_t SD_SCK   = 1;
@@ -23,12 +23,8 @@ namespace Pins {
   constexpr uint8_t CLICK_WAKE  = 18;
   constexpr uint8_t CLICK_RESET = 21;
 }
+Audio audio;
 
-AudioInfo audioInfo(44100, 2, 16);
-SineWaveGenerator<int16_t> sineWave(28000);
-GeneratedSoundStream<int16_t> sound(sineWave);
-I2SStream i2s;
-StreamCopy copier(i2s, sound);
 
 struct BtDevice {
   String name;
@@ -265,15 +261,10 @@ void setup() {
     Serial.println("[SD] Initialization failed!");
   }
 
-  auto config = i2s.defaultConfig(TX_MODE);
-  config.copyFrom(audioInfo);
-  config.pin_bck = Pins::DAC_BCK;
-  config.pin_ws = Pins::DAC_WS;
-  config.pin_data = Pins::DAC_DIN;
-  i2s.begin(config);
-
-  sineWave.begin(audioInfo, 440);
-  Serial.println("[Audio] 440Hz Sine Wave streaming to I2S DAC.");
+  audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
+  audio.setVolume(12);
+  audio.connecttoFS(SD, "/sample-15s.mp3");
+  Serial.println("[Audio] Playing sample-15s.mp3...");
 
   bt.onDeviceFound([](const BtDevice& dev) {
     Serial.printf("[BT] Found: %-25s | MAC: %s\n",
@@ -310,7 +301,8 @@ void setup() {
 }
 
 void loop() {
-  copier.copy();
+  audio.loop();
+  //copier.copy();
   bt.update();
   wheel.update(true);
 
@@ -319,4 +311,12 @@ void loop() {
     cmd.trim();
     if (cmd.length() > 0) bt.sendCommand(cmd);
   }
+}
+
+
+void audio_eof_mp3(const char *info) {
+  Serial.print("Track ended: ");
+  Serial.println(info);
+  
+  audio.connecttoFS(SD, "/sample-15s.mp3");
 }
