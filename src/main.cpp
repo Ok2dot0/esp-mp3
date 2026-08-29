@@ -4,85 +4,167 @@
 #include <functional>
 #include "Arduino.h"
 #include "Audio.h"
+#include <LovyanGFX.hpp>
 
-namespace Pins {
-  constexpr uint8_t SD_SCK   = 1;
-  constexpr uint8_t SD_MISO  = 9;
-  constexpr uint8_t SD_MOSI  = 3;
-  constexpr uint8_t SD_CS    = 10;
+namespace Pins
+{
+  constexpr uint8_t SD_SCK = 1;
+  constexpr uint8_t SD_MISO = 9;
+  constexpr uint8_t SD_MOSI = 3;
+  constexpr uint8_t SD_CS = 10;
 
-  constexpr uint8_t KCX_RX   = 14;
-  constexpr uint8_t KCX_TX   = 17;
+  constexpr uint8_t KCX_RX = 14;
+  constexpr uint8_t KCX_TX = 17;
 
-  constexpr uint8_t DAC_BCK  = 6;
-  constexpr uint8_t DAC_WS   = 7;
-  constexpr uint8_t DAC_DIN  = 16;
+  constexpr uint8_t DAC_BCK = 6;
+  constexpr uint8_t DAC_WS = 7;
+  constexpr uint8_t DAC_DIN = 16;
 
-  constexpr uint8_t CLICK_CLK   = 4;
-  constexpr uint8_t CLICK_DATA  = 5;
-  constexpr uint8_t CLICK_WAKE  = 18;
+  constexpr uint8_t CLICK_CLK = 4;
+  constexpr uint8_t CLICK_DATA = 5;
+  constexpr uint8_t CLICK_WAKE = 18;
   constexpr uint8_t CLICK_RESET = 21;
 }
 
 Audio audio;
 volatile bool shouldRepeatTrack = false;
 
-void audioInfoCallback(Audio::msg_t m) {
-  if (m.s && m.msg) {
+void audioInfoCallback(Audio::msg_t m)
+{
+  if (m.s && m.msg)
+  {
     Serial.printf("[Audio %s] %s\n", m.s, m.msg);
   }
-  
-  if (m.e == Audio::evt_eof) {
+
+  if (m.e == Audio::evt_eof)
+  {
     Serial.println("[Audio] EOF event detected!");
     shouldRepeatTrack = true;
   }
 }
 
-struct BtDevice {
+struct BtDevice
+{
   String name;
   String mac;
 };
 
-class KcxController {
+class LGFX : public lgfx::LGFX_Device
+{
+  lgfx::Panel_ILI9341 _panel_instance;
+  lgfx::Bus_SPI _bus_instance;
+  lgfx::Light_PWM _light_instance;
+
 public:
-  using DeviceCallback = std::function<void(const BtDevice&)>;
-  using StatusCallback = std::function<void(bool, const String&)>;
+  LGFX(void)
+  {
+    { // Configure SPI Bus
+      auto cfg = _bus_instance.config();
+
+      cfg.spi_host = SPI2_HOST;
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000;
+      cfg.freq_read = 16000000;
+      cfg.spi_3wire = false;
+
+      cfg.pin_sclk = 8;
+      cfg.pin_mosi = 42;
+      cfg.pin_miso = 13;
+      cfg.pin_dc = 2;
+
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+
+    {
+      auto cfg = _panel_instance.config();
+
+      cfg.pin_cs = 15;
+      cfg.pin_rst = -1;
+      cfg.pin_busy = -1;
+
+      cfg.panel_width = 240;
+      cfg.panel_height = 320;
+      cfg.offset_x = 0;
+      cfg.offset_y = 0;
+      cfg.offset_rotation = 0;
+      cfg.dummy_read_pixel = 8;
+      cfg.readable = true;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+
+      _panel_instance.config(cfg);
+    }
+
+    {
+      auto cfg = _light_instance.config();
+
+      cfg.pin_bl = -1;
+
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+
+    setPanel(&_panel_instance);
+  }
+};
+
+static LGFX lcd;
+
+class KcxController
+{
+public:
+  using DeviceCallback = std::function<void(const BtDevice &)>;
+  using StatusCallback = std::function<void(bool, const String &)>;
 
   KcxController(uint8_t rxPin, uint8_t txPin)
       : _rxPin(rxPin), _txPin(txPin), _serial(1) {}
 
-  void begin(uint32_t baud = 115200) {
+  void begin(uint32_t baud = 115200)
+  {
     _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
     delay(100);
-    while (_serial.available()) _serial.read();
+    while (_serial.available())
+      _serial.read();
   }
 
-  void update() {
-    while (_serial.available()) {
+  void update()
+  {
+    while (_serial.available())
+    {
       char c = static_cast<char>(_serial.read());
 
-      if (c == '\r') continue;
+      if (c == '\r')
+        continue;
 
-      if (c == '\n') {
+      if (c == '\n')
+      {
         _rxBuffer.trim();
-        if (_rxBuffer.length() > 0) parseLine(_rxBuffer);
+        if (_rxBuffer.length() > 0)
+          parseLine(_rxBuffer);
         _rxBuffer = "";
-      } else {
+      }
+      else
+      {
         _rxBuffer += c;
       }
     }
   }
 
-  void sendCommand(const String& cmd) {
+  void sendCommand(const String &cmd)
+  {
     _serial.print(cmd + "\r\n");
   }
 
-  void requestVersion() {
+  void requestVersion()
+  {
     sendCommand("AT+GMR?");
   }
 
-  void startScan(bool clearMemory = false) {
-    if (clearMemory) {
+  void startScan(bool clearMemory = false)
+  {
+    if (clearMemory)
+    {
       sendCommand("AT+DELADD=ALL");
       delay(50);
     }
@@ -90,25 +172,30 @@ public:
     sendCommand("AT+DISCON");
   }
 
-  void disconnect() {
+  void disconnect()
+  {
     sendCommand("AT+DISCON");
   }
 
-  void connectByMac(const String& rawMac) {
+  void connectByMac(const String &rawMac)
+  {
     String cleanMac = rawMac;
     cleanMac.replace(":", "");
     sendCommand("AT+CONADD=" + cleanMac);
   }
 
-  void connectByName(const String& name) {
+  void connectByName(const String &name)
+  {
     sendCommand("AT+CONNAME=" + name);
   }
 
-  void onDeviceFound(DeviceCallback cb) {
+  void onDeviceFound(DeviceCallback cb)
+  {
     _onDeviceFound = cb;
   }
 
-  void onConnectionChange(StatusCallback cb) {
+  void onConnectionChange(StatusCallback cb)
+  {
     _onStatusChange = cb;
   }
 
@@ -121,8 +208,10 @@ private:
   DeviceCallback _onDeviceFound = nullptr;
   StatusCallback _onStatusChange = nullptr;
 
-  void parseLine(const String& line) {
-    if (line.indexOf("MacAdd:") >= 0 && line.indexOf("Name:") >= 0) {
+  void parseLine(const String &line)
+  {
+    if (line.indexOf("MacAdd:") >= 0 && line.indexOf("Name:") >= 0)
+    {
       int macIdx = line.indexOf("MacAdd:");
       int nameIdx = line.indexOf("Name:");
 
@@ -133,34 +222,44 @@ private:
       String name = line.substring(nameIdx + 5);
       name.trim();
 
-      for (const auto& seen : _seenMacs) {
-        if (seen == mac) return;
+      for (const auto &seen : _seenMacs)
+      {
+        if (seen == mac)
+          return;
       }
       _seenMacs.push_back(mac);
 
       String formattedMac;
-      for (size_t i = 0; i < mac.length(); ++i) {
+      for (size_t i = 0; i < mac.length(); ++i)
+      {
         formattedMac += mac[i];
-        if ((i % 2 == 1) && (i + 1 < mac.length())) formattedMac += ':';
+        if ((i % 2 == 1) && (i + 1 < mac.length()))
+          formattedMac += ':';
       }
 
-      if (_onDeviceFound) _onDeviceFound({name, formattedMac});
+      if (_onDeviceFound)
+        _onDeviceFound({name, formattedMac});
       return;
     }
 
     if (line.indexOf("CONNECTED") >= 0 ||
         line.indexOf("CON MATCH") >= 0 ||
-        line.startsWith("CONNECT=>")) {
-      if (_onStatusChange) _onStatusChange(true, line);
+        line.startsWith("CONNECT=>"))
+    {
+      if (_onStatusChange)
+        _onStatusChange(true, line);
       return;
     }
 
-    if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON") {
-      if (_onStatusChange) _onStatusChange(false, line);
+    if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
+    {
+      if (_onStatusChange)
+        _onStatusChange(false, line);
       return;
     }
 
-    if (line.indexOf("OK+VERS:") >= 0) {
+    if (line.indexOf("OK+VERS:") >= 0)
+    {
       Serial.printf("[KCX] Firmware: %s\n", line.c_str());
     }
   }
@@ -168,9 +267,11 @@ private:
 
 KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
 
-class ClickWheel {
+class ClickWheel
+{
 public:
-  struct State {
+  struct State
+  {
     bool touching;
     uint8_t position;
     uint8_t buttons;
@@ -182,55 +283,64 @@ public:
     uint8_t statusByte;
   };
 
-  using ReportCallback = std::function<void(const State&)>;
+  using ReportCallback = std::function<void(const State &)>;
 
   ClickWheel(uint8_t clkPin, uint8_t dataPin)
       : _clkPin(clkPin), _dataPin(dataPin) {}
 
-  void begin(void (*isr)()) {
+  void begin(void (*isr)())
+  {
     pinMode(_clkPin, INPUT_PULLUP);
     pinMode(_dataPin, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(_clkPin), isr, FALLING);
   }
 
-  void onReport(ReportCallback cb) {
+  void onReport(ReportCallback cb)
+  {
     _onReport = cb;
   }
 
-  void update(bool printRaw = false) {
-    if (!_frameReady) return;
+  void update(bool printRaw = false)
+  {
+    if (!_frameReady)
+      return;
 
     uint8_t frame[4];
 
     noInterrupts();
-    for (uint8_t i = 0; i < 4; ++i) frame[i] = _frame[i];
+    for (uint8_t i = 0; i < 4; ++i)
+      frame[i] = _frame[i];
     _frameReady = false;
     interrupts();
 
-    if (printRaw) {
+    if (printRaw)
+    {
       Serial.printf("[Wheel] raw: %02X %02X %02X %02X\n",
                     frame[0], frame[1], frame[2], frame[3]);
     }
 
     State state;
-    state.buttons    = frame[1];
-    state.btnCenter  = (frame[1] & 0x01) != 0;
-    state.btnRight   = (frame[1] & 0x02) != 0;
-    state.btnLeft    = (frame[1] & 0x04) != 0;
-    state.btnDown    = (frame[1] & 0x08) != 0;
-    state.btnUp      = (frame[1] & 0x10) != 0;
-    state.position   = frame[2];
-    state.touching   = (frame[3] & 0x40) != 0;
+    state.buttons = frame[1];
+    state.btnCenter = (frame[1] & 0x01) != 0;
+    state.btnRight = (frame[1] & 0x02) != 0;
+    state.btnLeft = (frame[1] & 0x04) != 0;
+    state.btnDown = (frame[1] & 0x08) != 0;
+    state.btnUp = (frame[1] & 0x10) != 0;
+    state.position = frame[2];
+    state.touching = (frame[3] & 0x40) != 0;
     state.statusByte = frame[3];
 
-    if (_onReport) _onReport(state);
+    if (_onReport)
+      _onReport(state);
   }
 
-  void IRAM_ATTR handleEdge() {
+  void IRAM_ATTR handleEdge()
+  {
     uint32_t now = micros();
 
     if ((_byteIndex != 0 || _bitCount != 0) &&
-        (now - _lastEdgeUs) > kFrameGapTimeoutUs) {
+        (now - _lastEdgeUs) > kFrameGapTimeoutUs)
+    {
       _shiftByte = 0;
       _bitCount = 0;
       _byteIndex = 0;
@@ -242,9 +352,11 @@ public:
     _shiftByte |= static_cast<uint8_t>(bit << _bitCount);
     _bitCount = _bitCount + 1;
 
-    if (_bitCount < 8) return;
+    if (_bitCount < 8)
+      return;
 
-    if (_byteIndex == 0 && _shiftByte != 0x1A) {
+    if (_byteIndex == 0 && _shiftByte != 0x1A)
+    {
       _shiftByte = 0;
       _bitCount = 0;
       return;
@@ -255,7 +367,8 @@ public:
     _shiftByte = 0;
     _bitCount = 0;
 
-    if (_byteIndex == 4) {
+    if (_byteIndex == 4)
+    {
       _byteIndex = 0;
       _frameReady = true;
     }
@@ -281,37 +394,51 @@ private:
 
 ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
 
-void IRAM_ATTR clickWheelISR() {
+void IRAM_ATTR clickWheelISR()
+{
   wheel.handleEdge();
 }
 
-bool initSD() {
+bool initSD()
+{
   SPI.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
   return SD.begin(Pins::SD_CS);
 }
 
-void pulseClickWheelReset() {
+void pulseClickWheelReset()
+{
   digitalWrite(Pins::CLICK_RESET, LOW);
   delay(20);
   digitalWrite(Pins::CLICK_RESET, HIGH);
   delay(50);
 }
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(500);
 
   Serial.println("\n=== System Starting ===");
-
+  lcd.init();
+  lcd.setRotation(3);
+  lcd.setColorDepth(18);
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.setTextSize(2);
+  lcd.setCursor(20, 20);
+  lcd.println("ILI9341 Display Ready!");
   Audio::audio_info_callback = audioInfoCallback;
 
   pinMode(Pins::CLICK_RESET, OUTPUT);
   pulseClickWheelReset();
   pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
 
-  if (initSD()) {
+  if (initSD())
+  {
     Serial.println("[SD] Initialized successfully.");
-  } else {
+  }
+  else
+  {
     Serial.println("[SD] Initialization failed!");
   }
 
@@ -320,45 +447,46 @@ void setup() {
   audio.connecttoFS(SD, "/sample-15s.mp3");
   Serial.println("[Audio] Playing sample-15s.mp3...");
 
-  bt.onDeviceFound([](const BtDevice& dev) {
+  bt.onDeviceFound([](const BtDevice &dev)
+                   {
     Serial.printf("[BT] Found: %-25s | MAC: %s\n",
                   dev.name.c_str(), dev.mac.c_str());
-    bt.connectByMac(dev.mac);
-  });
+    bt.connectByMac(dev.mac); });
 
-  bt.onConnectionChange([](bool connected, const String&) {
+  bt.onConnectionChange([](bool connected, const String &)
+                        {
     if (connected) {
       Serial.println("[BT] Status: Connected to audio sink.");
     } else {
       Serial.println("[BT] Status: Disconnected / Scanning.");
-    }
-  });
+    } });
 
   bt.begin();
   bt.requestVersion();
   Serial.println("[BT] Starting clean scan...");
   bt.startScan(true);
 
-  wheel.onReport([](const ClickWheel::State& state) {
-    Serial.printf("[Wheel] %s pos=%3u | Buttons [Center:%d Menu:%d Play:%d Next:%d Prev:%d]\n",
-                  state.touching ? "TOUCH" : "FREE ",
-                  state.position,
-                  state.btnCenter,
-                  state.btnUp,
-                  state.btnDown,
-                  state.btnRight,
-                  state.btnLeft);
-  });
+  wheel.onReport([](const ClickWheel::State &state)
+                 { Serial.printf("[Wheel] %s pos=%3u | Buttons [Center:%d Menu:%d Play:%d Next:%d Prev:%d]\n",
+                                 state.touching ? "TOUCH" : "FREE ",
+                                 state.position,
+                                 state.btnCenter,
+                                 state.btnUp,
+                                 state.btnDown,
+                                 state.btnRight,
+                                 state.btnLeft); });
 
   wheel.begin(clickWheelISR);
   Serial.println("[Wheel] Click wheel listener started.");
 }
 
-void loop() {
+void loop()
+{
   audio.loop();
   vTaskDelay(1);
 
-  if (shouldRepeatTrack) {
+  if (shouldRepeatTrack)
+  {
     shouldRepeatTrack = false;
     Serial.println("[Audio] Restarting track...");
     audio.connecttoFS(SD, "/sample-15s.mp3");
@@ -369,7 +497,8 @@ void loop() {
 
   static unsigned long lastWheelDiag = 0;
   static uint32_t lastDiagEdgeCount = 0;
-  if (millis() - lastWheelDiag > 2000) {
+  if (millis() - lastWheelDiag > 2000)
+  {
     lastWheelDiag = millis();
     uint32_t edgesNow = wheel.edgeCount();
     Serial.printf("[Wheel] diag: %lu total edges (+%lu since last check) | WAKE=%d\n",
@@ -378,9 +507,11 @@ void loop() {
     lastDiagEdgeCount = edgesNow;
   }
 
-  if (Serial.available()) {
+  if (Serial.available())
+  {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    if (cmd.length() > 0) bt.sendCommand(cmd);
+    if (cmd.length() > 0)
+      bt.sendCommand(cmd);
   }
 }
