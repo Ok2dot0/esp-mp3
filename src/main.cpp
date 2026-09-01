@@ -1,11 +1,11 @@
+#include "Arduino.h"
 #include <SPI.h>
 #include <SD.h>
 #include <vector>
 #include <functional>
-#include "Arduino.h"
+#include <algorithm>
 #include "Audio.h"
 #include <LovyanGFX.hpp>
-#include <algorithm>
 
 namespace Pins
 {
@@ -34,27 +34,15 @@ namespace Pins
   constexpr uint8_t LCD_BL = -1;
 }
 
-Audio audio;
-volatile bool shouldRepeatTrack = false;
-
-void audioInfoCallback(Audio::msg_t m)
-{
-  if (m.s && m.msg)
-  {
-    Serial.printf("[Audio %s] %s\n", m.s, m.msg);
-  }
-
-  if (m.e == Audio::evt_eof)
-  {
-    Serial.println("[Audio] EOF event detected!");
-    shouldRepeatTrack = true;
-  }
-}
-
 struct BtDevice
 {
   String name;
   String mac;
+};
+
+struct Track
+{
+  String path;
 };
 
 class LGFX : public lgfx::LGFX_Device
@@ -66,7 +54,7 @@ class LGFX : public lgfx::LGFX_Device
 public:
   LGFX(void)
   {
-    { // Configure SPI Bus
+    {
       auto cfg = _bus_instance.config();
 
       cfg.spi_host = SPI2_HOST;
@@ -117,7 +105,60 @@ public:
   }
 };
 
-static LGFX lcd;
+class FileSystem
+{
+public:
+  inline static std::vector<Track> _tracks;
+
+  static bool initSD()
+  {
+    SPI.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
+    return SD.begin(Pins::SD_CS);
+  }
+
+  static void scan(const char *rootPath = "/")
+  {
+    _tracks.clear();
+    File root = SD.open(rootPath);
+    if (!root || !root.isDirectory())
+    {
+      Serial.printf("[FS] Failed to open directory: %s\n", rootPath);
+      return;
+    }
+    scanDirectory(root);
+  }
+
+private:
+  static void scanDirectory(File &dir, uint8_t depth = 0)
+  {
+    File entry = dir.openNextFile();
+    while (entry)
+    {
+      String name = String(entry.name());
+      int slashIdx = name.lastIndexOf('/');
+      String cleanName = (slashIdx >= 0) ? name.substring(slashIdx + 1) : name;
+
+      String lowerName = cleanName;
+      lowerName.toLowerCase();
+
+      if (entry.isDirectory())
+      {
+        if (cleanName != "." && cleanName != ".." && cleanName.indexOf("System Volume") < 0 && cleanName.indexOf("$RECYCLE") < 0)
+        {
+          scanDirectory(entry, depth + 1);
+        }
+      }
+      else if (lowerName.endsWith(".mp3") || lowerName.endsWith(".wav") || lowerName.endsWith(".flac") || lowerName.endsWith(".m4a"))
+      {
+        String fullPath = entry.path();
+        if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
+        _tracks.push_back({fullPath});
+      }
+      entry.close();
+      entry = dir.openNextFile();
+    }
+  }
+};
 
 class KcxController
 {
@@ -273,8 +314,6 @@ private:
   }
 };
 
-KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
-
 class ClickWheel
 {
 public:
@@ -404,73 +443,33 @@ private:
   static constexpr uint32_t kFrameGapTimeoutUs = 1500;
 };
 
+KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
 ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
+static LGFX lcd;
 
-struct Track
+Audio audio;
+volatile bool shouldRepeatTrack = false;
+
+void audioInfoCallback(Audio::msg_t m)
 {
-  String path;
-};
-
-class FileSystem
-{
-public:
-  inline static std::vector<Track> _tracks;
-
-  static bool initSD()
+  if (m.s && m.msg)
   {
-    SPI.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
-    return SD.begin(Pins::SD_CS);
+    Serial.printf("[Audio %s] %s\n", m.s, m.msg);
   }
 
-  static void scan(const char *rootPath = "/")
+  if (m.e == Audio::evt_eof)
   {
-    _tracks.clear();
-    File root = SD.open(rootPath);
-    if (!root || !root.isDirectory())
-    {
-      Serial.printf("[FS] Failed to open directory: %s\n", rootPath);
-      return;
-    }
-    scanDirectory(root);
+    Serial.println("[Audio] EOF event detected!");
+    shouldRepeatTrack = true;
   }
-
-  static void scanDirectory(File &dir, uint8_t depth = 0)
-  {
-    File entry = dir.openNextFile();
-    while (entry)
-    {
-      String name = String(entry.name());
-      int slashIdx = name.lastIndexOf('/');
-      String cleanName = (slashIdx >= 0) ? name.substring(slashIdx + 1) : name;
-
-      String lowerName = cleanName;
-      lowerName.toLowerCase();
-
-      if (entry.isDirectory())
-      {
-        if (cleanName != "." && cleanName != ".." && cleanName.indexOf("System Volume") < 0 && cleanName.indexOf("$RECYCLE") < 0)
-        {
-          scanDirectory(entry, depth + 1);
-        }
-      }
-      else if (lowerName.endsWith(".mp3") || lowerName.endsWith(".wav") || lowerName.endsWith(".flac") || lowerName.endsWith(".m4a"))
-      {
-        String fullPath = entry.path();
-        if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
-        _tracks.push_back({fullPath});
-      }
-      entry.close();
-      entry = dir.openNextFile();
-    }
-  }
-};
+}
 
 void IRAM_ATTR clickWheelISR()
 {
   wheel.handleEdge();
 }
 
-void pulseClickWheelReset()
+void resetClickWheel()
 {
   digitalWrite(Pins::CLICK_RESET, LOW);
   delay(20);
@@ -478,12 +477,15 @@ void pulseClickWheelReset()
   delay(50);
 }
 
-void setup()
+void setupSerial()
 {
   Serial.begin(115200);
   delay(500);
-
   Serial.println("\n=== System Starting ===");
+}
+
+void setupDisplay()
+{
   lcd.init();
   lcd.setRotation(3);
   lcd.setColorDepth(18);
@@ -492,82 +494,118 @@ void setup()
   lcd.setTextSize(2);
   lcd.setCursor(20, 20);
   lcd.println("ILI9341 Display Ready!");
+}
+
+void setupAudio()
+{
   Audio::audio_info_callback = audioInfoCallback;
+  audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
+  audio.setVolume(12);
+}
 
-  pinMode(Pins::CLICK_RESET, OUTPUT);
-  pulseClickWheelReset();
-  pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
-
+void setupFileSystem()
+{
   if (FileSystem::initSD())
   {
     Serial.println("[SD] Initialized successfully.");
+    FileSystem::scan("/");
+    if (!FileSystem::_tracks.empty())
+    {
+      audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
+      Serial.println("[Audio] Playing sample track...");
+    }
   }
   else
   {
     Serial.println("[SD] Initialization failed!");
   }
+}
 
-  audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
-  audio.setVolume(12);
-  if (!FileSystem::_tracks.empty()) {
-    audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
-  }
-  Serial.println("[Audio] Playing sample-15s.mp3...");
-
-  bt.onDeviceFound([](const BtDevice &dev)
-                   {
-    Serial.printf("[BT] Found: %-25s | MAC: %s\n",
-                  dev.name.c_str(), dev.mac.c_str());
-    bt.connectByMac(dev.mac); });
-
-  bt.onConnectionChange([](bool connected, const String &)
-                        {
-    if (connected) {
-      Serial.println("[BT] Status: Connected to audio sink.");
-    } else {
-      Serial.println("[BT] Status: Disconnected / Scanning.");
-    } });
-
-  bt.begin();
-  bt.requestVersion();
-  Serial.println("[BT] Starting clean scan...");
-  bt.startScan(true);
+void setupClickWheel()
+{
+  pinMode(Pins::CLICK_RESET, OUTPUT);
+  resetClickWheel();
+  pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
 
   wheel.onReport([](const ClickWheel::State &state)
-                 { Serial.printf("[Wheel] %s pos=%3u | Buttons [Center:%d Menu:%d Play:%d Next:%d Prev:%d]\n",
-                                 state.touching ? "TOUCH" : "FREE ",
-                                 state.position,
-                                 state.btnCenter,
-                                 state.btnUp,
-                                 state.btnDown,
-                                 state.btnRight,
-                                 state.btnLeft); });
+  {
+    Serial.printf("[Wheel] %s pos=%3u | Buttons [C:%d U:%d D:%d R:%d L:%d]\n",
+                  state.touching ? "TOUCH" : "FREE ",
+                  state.position,
+                  state.btnCenter,
+                  state.btnUp,
+                  state.btnDown,
+                  state.btnRight,
+                  state.btnLeft);
+  });
 
   wheel.begin(clickWheelISR);
   Serial.println("[Wheel] Click wheel listener started.");
 }
 
-void loop()
+void setupBluetooth()
+{
+  bt.onDeviceFound([](const BtDevice &dev)
+  {
+    Serial.printf("[BT] Found: %-25s | MAC: %s\n", dev.name.c_str(), dev.mac.c_str());
+    bt.connectByMac(dev.mac);
+  });
+
+  bt.onConnectionChange([](bool connected, const String &)
+  {
+    if (connected)
+      Serial.println("[BT] Status: Connected to audio sink.");
+    else
+      Serial.println("[BT] Status: Disconnected / Scanning.");
+  });
+
+  bt.begin();
+  bt.requestVersion();
+  Serial.println("[BT] Starting clean scan...");
+  bt.startScan(true);
+}
+
+void setup()
+{
+  setupSerial();
+  setupDisplay();
+  setupAudio();
+  setupFileSystem();
+  setupClickWheel();
+  setupBluetooth();
+}
+
+void loopAudio()
 {
   audio.loop();
-  vTaskDelay(1);
-  lcd.clear(TFT_BLACK);
-  lcd.setCursor(0, 0);
-  lcd.println("Current Track:");
-  if (!FileSystem::_tracks.empty()) {
-    lcd.println(FileSystem::_tracks[0].path);
-  } else {
-    lcd.println("No tracks found.");
-  }
 
   if (shouldRepeatTrack)
   {
     shouldRepeatTrack = false;
     Serial.println("[Audio] Restarting track...");
-    audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
+    if (!FileSystem::_tracks.empty())
+      audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
   }
+}
 
+void loopDisplay()
+{
+  lcd.clear(TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println("Current Track:");
+  if (!FileSystem::_tracks.empty())
+    lcd.println(FileSystem::_tracks[0].path);
+  else
+    lcd.println("No tracks found.");
+}
+
+void loopBluetooth()
+{
   bt.update();
+}
+
+void loopClickWheel()
+{
   wheel.update(true);
 
   static unsigned long lastWheelDiag = 0;
@@ -576,12 +614,16 @@ void loop()
   {
     lastWheelDiag = millis();
     uint32_t edgesNow = wheel.edgeCount();
-    Serial.printf("[Wheel] diag: %lu total edges (+%lu since last check) | WAKE=%d\n",
-                  (unsigned long)edgesNow, (unsigned long)(edgesNow - lastDiagEdgeCount),
+    Serial.printf("[Wheel] diag: %lu total edges (+%lu since last) | WAKE=%d\n",
+                  (unsigned long)edgesNow,
+                  (unsigned long)(edgesNow - lastDiagEdgeCount),
                   digitalRead(Pins::CLICK_WAKE));
     lastDiagEdgeCount = edgesNow;
   }
+}
 
+void loopSerialCommands()
+{
   if (Serial.available())
   {
     String cmd = Serial.readStringUntil('\n');
@@ -589,4 +631,14 @@ void loop()
     if (cmd.length() > 0)
       bt.sendCommand(cmd);
   }
+}
+
+void loop()
+{
+  loopAudio();
+  loopBluetooth();
+  loopClickWheel();
+  loopDisplay();
+  loopSerialCommands();
+  vTaskDelay(1);
 }
