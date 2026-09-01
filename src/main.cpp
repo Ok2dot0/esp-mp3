@@ -282,6 +282,7 @@ public:
   {
     bool touching;
     uint8_t position;
+    uint8_t delta;
     uint8_t buttons;
     bool btnCenter;
     bool btnRight;
@@ -334,6 +335,8 @@ public:
     state.btnLeft = (frame[1] & 0x04) != 0;
     state.btnDown = (frame[1] & 0x08) != 0;
     state.btnUp = (frame[1] & 0x10) != 0;
+    state.delta = frame[2] - _lastPosition;
+    _lastPosition = frame[2];
     state.position = frame[2];
     state.touching = (frame[3] & 0x40) != 0;
     state.statusByte = frame[3];
@@ -397,6 +400,7 @@ private:
 
   volatile uint32_t _lastEdgeUs = 0;
   volatile uint32_t _edgeCount = 0;
+  uint8_t _lastPosition = 0;
   static constexpr uint32_t kFrameGapTimeoutUs = 1500;
 };
 
@@ -505,7 +509,9 @@ void setup()
 
   audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
   audio.setVolume(12);
-  audio.connecttoFS(SD, "/sample-15s.mp3");
+  if (!FileSystem::_tracks.empty()) {
+    audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
+  }
   Serial.println("[Audio] Playing sample-15s.mp3...");
 
   bt.onDeviceFound([](const BtDevice &dev)
@@ -545,12 +551,20 @@ void loop()
 {
   audio.loop();
   vTaskDelay(1);
+  lcd.clear(TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println("Current Track:");
+  if (!FileSystem::_tracks.empty()) {
+    lcd.println(FileSystem::_tracks[0].path);
+  } else {
+    lcd.println("No tracks found.");
+  }
 
   if (shouldRepeatTrack)
   {
     shouldRepeatTrack = false;
     Serial.println("[Audio] Restarting track...");
-    audio.connecttoFS(SD, "/sample-15s.mp3");
+    audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
   }
 
   bt.update();
