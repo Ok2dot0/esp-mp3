@@ -43,6 +43,7 @@ struct BtDevice
 struct Track
 {
   String path;
+  String name;
 };
 
 class LGFX : public lgfx::LGFX_Device
@@ -152,7 +153,7 @@ private:
       {
         String fullPath = entry.path();
         if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
-        _tracks.push_back({fullPath});
+        _tracks.push_back({fullPath, cleanName});
       }
       entry.close();
       entry = dir.openNextFile();
@@ -449,6 +450,7 @@ static LGFX lcd;
 
 Audio audio;
 volatile bool shouldRepeatTrack = false;
+volatile int volume = 12;
 
 void audioInfoCallback(Audio::msg_t m)
 {
@@ -500,7 +502,7 @@ void setupAudio()
 {
   Audio::audio_info_callback = audioInfoCallback;
   audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
-  audio.setVolume(12);
+  audio.setVolume(volume);
 }
 
 void setupFileSystem()
@@ -512,7 +514,7 @@ void setupFileSystem()
     if (!FileSystem::_tracks.empty())
     {
       audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
-      Serial.println("[Audio] Playing sample track...");
+      Serial.println("[Audio] Playing first track: " + FileSystem::_tracks[0].name);
     }
   }
   else
@@ -578,11 +580,12 @@ void setup()
 void loopAudio()
 {
   audio.loop();
+  audio.setVolume(volume);
 
   if (shouldRepeatTrack)
   {
     shouldRepeatTrack = false;
-    Serial.println("[Audio] Restarting track...");
+    Serial.println("[Audio] Restarting track: " + FileSystem::_tracks[0].name);
     if (!FileSystem::_tracks.empty())
       audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
   }
@@ -594,7 +597,7 @@ void loopDisplay()
   lcd.setCursor(0, 0);
   lcd.println("Current Track:");
   if (!FileSystem::_tracks.empty())
-    lcd.println(FileSystem::_tracks[0].path);
+    lcd.println(FileSystem::_tracks[0].name);
   else
     lcd.println("No tracks found.");
 }
@@ -610,6 +613,9 @@ void loopClickWheel()
 
   static unsigned long lastWheelDiag = 0;
   static uint32_t lastDiagEdgeCount = 0;
+  volume = volume + ClickWheel::State().delta;
+  if (volume < 0) volume = 0;
+  if (volume > 21) volume = 21;
   if (millis() - lastWheelDiag > 2000)
   {
     lastWheelDiag = millis();
