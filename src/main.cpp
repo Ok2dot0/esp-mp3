@@ -600,6 +600,8 @@ void loopDisplay()
     lcd.println(FileSystem::_tracks[0].name);
   else
     lcd.println("No tracks found.");
+  lcd.setCursor(0, 60);
+  lcd.printf("Volume: %d\n", volume);
 }
 
 void loopBluetooth()
