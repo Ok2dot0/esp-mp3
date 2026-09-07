@@ -476,7 +476,9 @@ static LGFX lcd;
 Audio audio;
 volatile bool shouldRepeatTrack = false;
 volatile int volume = 12;
-volatile int8_t wheelVolumeDelta = 0;
+// Accumulated wheel motion not yet converted into volume steps.
+// Filled by the wheel report callback, consumed by loopClickWheel().
+volatile int wheelVolumeDelta = 0;
 
 void audioInfoCallback(Audio::msg_t m)
 {
@@ -565,7 +567,22 @@ void setupClickWheel()
 
   wheel.onReport([](const ClickWheel::State &state)
   {
-    wheelVolumeDelta = (int8_t)(wheelVolumeDelta + state.delta);
+    // Convert wheel motion into volume input. Only count motion while the
+    // finger stays down: a fresh touch has no reference position, so using
+    // it would turn every re-touch into a random volume jump.
+    static uint8_t prevPos = 0;
+    static bool prevTouch = false;
+    if (state.touching && prevTouch)
+    {
+      // int8_t cast keeps the 0..255 wraparound direction-aware.
+      int d = (int8_t)(state.position - prevPos);
+      // Clamp spikes from noisy frames; the accumulator keeps the rest.
+      if (d > 10) d = 10;
+      if (d < -10) d = -10;
+      wheelVolumeDelta += d;
+    }
+    prevPos = state.position;
+    prevTouch = state.touching;
     Serial.printf("[Wheel] %s pos=%3u | Buttons [C:%d U:%d D:%d R:%d L:%d]\n",
                   state.touching ? "TOUCH" : "FREE ",
                   state.position,
@@ -630,19 +647,21 @@ void loopAudio()
 
 void loopDisplay()
 {
-  // Full-screen redraws are slow (tens of ms on SPI) and would starve
-  // audio.loop(), so refresh at most 4 times per second.
-  static unsigned long lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate < 250)
+  // Redraw only when something actually changed. Clearing and rewriting
+  // the screen on a timer is what made it visibly blink; untouched
+  // pixels stay exactly as they are now.
+  static String lastTrack = "";
+  static int lastVolume = -1;
+  String track = FileSystem::_tracks.empty() ? "No tracks found." : FileSystem::_tracks[0].name;
+  if (track == lastTrack && volume == lastVolume)
     return;
-  lastDisplayUpdate = millis();
-  lcd.clear(TFT_BLACK);
+  lastTrack = track;
+  lastVolume = volume;
+  // Repaint just the text area instead of the whole screen.
+  lcd.fillRect(0, 0, lcd.width(), 90, TFT_BLACK);
   lcd.setCursor(0, 0);
   lcd.println("Current Track:");
-  if (!FileSystem::_tracks.empty())
-    lcd.println(FileSystem::_tracks[0].name);
-  else
-    lcd.println("No tracks found.");
+  lcd.println(track);
   lcd.setCursor(0, 60);
   lcd.printf("Volume: %d\n", volume);
 }
@@ -658,16 +677,26 @@ void loopClickWheel()
 
   static unsigned long lastWheelDiag = 0;
   static uint32_t lastDiagEdgeCount = 0;
+  // Fractional accumulation: 1 volume step per 4 wheel units. The leftover
+  // remainder is kept, so slow turns still register smoothly and fast
+  // spins don't overshoot in one jump.
+  static int volRemainder = 0;
   noInterrupts();
-  int8_t dv = wheelVolumeDelta;
+  int dv = wheelVolumeDelta;
   wheelVolumeDelta = 0;
   interrupts();
   if (dv != 0)
   {
-    volume = volume + dv;
-    if (volume < 0) volume = 0;
-    if (volume > 21) volume = 21;
-    Serial.printf("[Audio] Volume: %d\n", volume);
+    volRemainder += dv;
+    int steps = volRemainder / 4;
+    if (steps != 0)
+    {
+      volRemainder -= steps * 4;
+      volume = volume + steps;
+      if (volume < 0) volume = 0;
+      if (volume > 21) volume = 21;
+      Serial.printf("[Audio] Volume: %d\n", volume);
+    }
   }
   if (millis() - lastWheelDiag > 2000)
   {
