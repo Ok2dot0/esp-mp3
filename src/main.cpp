@@ -46,8 +46,7 @@ struct Track
   String name;
 };
 
-class LGFX : public lgfx::LGFX_Device
-{
+class LGFX : public lgfx::LGFX_Device{
   lgfx::Panel_ILI9341 _panel_instance;
   lgfx::Bus_SPI _bus_instance;
   lgfx::Light_PWM _light_instance;
@@ -110,11 +109,37 @@ class FileSystem
 {
 public:
   inline static std::vector<Track> _tracks;
+  // Dedicated SPI bus for the SD card. The LCD (LovyanGFX) owns the default
+  // SPI2/FSPI host, so the SD card gets SPI3/HSPI to avoid both drivers
+  // fighting over one host with different pins.
+  inline static SPIClass _sdSpi = SPIClass(HSPI);
 
   static bool initSD()
   {
-    SPI.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
-    return SD.begin(Pins::SD_CS);
+    // Deselect both SPI devices before touching the bus so the LCD
+    // (already initialized) cannot answer to SD traffic.
+    pinMode(Pins::LCD_CS, OUTPUT);
+    digitalWrite(Pins::LCD_CS, HIGH);
+    pinMode(Pins::SD_CS, OUTPUT);
+    digitalWrite(Pins::SD_CS, HIGH);
+    // Give the card time to power up after the ESP32 booted.
+    delay(500);
+    _sdSpi.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
+    // Retry mount, stepping the SPI clock down: marginal wiring that
+    // fails at 10 MHz often works at 4 MHz or 1 MHz.
+    static constexpr uint32_t kSpeeds[] = {10000000, 4000000, 1000000};
+    for (uint8_t attempt = 0; attempt < 5; ++attempt)
+    {
+      uint32_t freq = kSpeeds[attempt < 3 ? attempt : 2];
+      Serial.printf("[SD] Mount attempt %u at %lu Hz...\n", attempt + 1, (unsigned long)freq);
+      digitalWrite(Pins::SD_CS, HIGH);
+      delay(100);
+      if (SD.begin(Pins::SD_CS, _sdSpi, freq))
+        return true;
+      Serial.println("[SD] Attempt failed, retrying...");
+      delay(300);
+    }
+    return false;
   }
 
   static void scan(const char *rootPath = "/")
@@ -451,6 +476,7 @@ static LGFX lcd;
 Audio audio;
 volatile bool shouldRepeatTrack = false;
 volatile int volume = 12;
+volatile int8_t wheelVolumeDelta = 0;
 
 void audioInfoCallback(Audio::msg_t m)
 {
@@ -510,11 +536,19 @@ void setupFileSystem()
   if (FileSystem::initSD())
   {
     Serial.println("[SD] Initialized successfully.");
+    Serial.printf("[SD] Type: %u, size: %llu MB\n",
+                  SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
     FileSystem::scan("/");
+    Serial.printf("[FS] Found %u track(s).\n", (unsigned)FileSystem::_tracks.size());
     if (!FileSystem::_tracks.empty())
     {
-      audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
-      Serial.println("[Audio] Playing first track: " + FileSystem::_tracks[0].name);
+      bool ok = audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
+      Serial.printf("[Audio] Playing first track: %s (connect %s)\n",
+                    FileSystem::_tracks[0].name.c_str(), ok ? "OK" : "FAILED");
+    }
+    else
+    {
+      Serial.println("[FS] No tracks found, nothing to play.");
     }
   }
   else
@@ -531,6 +565,7 @@ void setupClickWheel()
 
   wheel.onReport([](const ClickWheel::State &state)
   {
+    wheelVolumeDelta = (int8_t)(wheelVolumeDelta + state.delta);
     Serial.printf("[Wheel] %s pos=%3u | Buttons [C:%d U:%d D:%d R:%d L:%d]\n",
                   state.touching ? "TOUCH" : "FREE ",
                   state.position,
@@ -585,14 +620,22 @@ void loopAudio()
   if (shouldRepeatTrack)
   {
     shouldRepeatTrack = false;
-    Serial.println("[Audio] Restarting track: " + FileSystem::_tracks[0].name);
     if (!FileSystem::_tracks.empty())
+    {
+      Serial.println("[Audio] Restarting track: " + FileSystem::_tracks[0].name);
       audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
+    }
   }
 }
 
 void loopDisplay()
 {
+  // Full-screen redraws are slow (tens of ms on SPI) and would starve
+  // audio.loop(), so refresh at most 4 times per second.
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate < 250)
+    return;
+  lastDisplayUpdate = millis();
   lcd.clear(TFT_BLACK);
   lcd.setCursor(0, 0);
   lcd.println("Current Track:");
@@ -615,9 +658,17 @@ void loopClickWheel()
 
   static unsigned long lastWheelDiag = 0;
   static uint32_t lastDiagEdgeCount = 0;
-  volume = volume + ClickWheel::State().delta;
-  if (volume < 0) volume = 0;
-  if (volume > 21) volume = 21;
+  noInterrupts();
+  int8_t dv = wheelVolumeDelta;
+  wheelVolumeDelta = 0;
+  interrupts();
+  if (dv != 0)
+  {
+    volume = volume + dv;
+    if (volume < 0) volume = 0;
+    if (volume > 21) volume = 21;
+    Serial.printf("[Audio] Volume: %d\n", volume);
+  }
   if (millis() - lastWheelDiag > 2000)
   {
     lastWheelDiag = millis();
