@@ -1,498 +1,30 @@
+// esp-mp3: iPod-style ESP32-S3 music player.
+//
+// Modules (see include/ + src/):
+//   pins         - central pin map
+//   filesystem   - SD card + audio file discovery
+//   bluetooth    - KCX BT emitter driver + connection state
+//   clickwheel   - iPod click wheel decoder
+//   display      - LCD now-playing screen (track, volume, bluetooth)
+//   audio_player - I2S playback, volume, auto-repeat
+//
+// main.cpp only owns the module instances and wires them together.
+
 #include "Arduino.h"
-#include <SPI.h>
-#include <SD.h>
-#include <vector>
-#include <functional>
-#include <algorithm>
-#include "Audio.h"
-#include <LovyanGFX.hpp>
+#include "audio_player.h"
+#include "bluetooth.h"
+#include "clickwheel.h"
+#include "display.h"
+#include "filesystem.h"
+#include "pins.h"
 
-namespace Pins
+namespace
 {
-  constexpr uint8_t SD_SCK = 1;
-  constexpr uint8_t SD_MISO = 9;
-  constexpr uint8_t SD_MOSI = 3;
-  constexpr uint8_t SD_CS = 10;
-
-  constexpr uint8_t KCX_RX = 14;
-  constexpr uint8_t KCX_TX = 17;
-
-  constexpr uint8_t DAC_BCK = 6;
-  constexpr uint8_t DAC_WS = 7;
-  constexpr uint8_t DAC_DIN = 16;
-
-  constexpr uint8_t CLICK_CLK = 4;
-  constexpr uint8_t CLICK_DATA = 5;
-  constexpr uint8_t CLICK_WAKE = 18;
-  constexpr uint8_t CLICK_RESET = 21;
-
-  constexpr uint8_t LCD_SCLK = 8;
-  constexpr uint8_t LCD_MOSI = 42;
-  constexpr uint8_t LCD_MISO = 13;
-  constexpr uint8_t LCD_DC = 2;
-  constexpr uint8_t LCD_CS = 15;
-  constexpr uint8_t LCD_BL = -1;
-}
-
-struct BtDevice
-{
-  String name;
-  String mac;
-};
-
-struct Track
-{
-  String path;
-  String name;
-};
-
-class LGFX : public lgfx::LGFX_Device{
-  lgfx::Panel_ILI9341 _panel_instance;
-  lgfx::Bus_SPI _bus_instance;
-  lgfx::Light_PWM _light_instance;
-
-public:
-  LGFX(void)
-  {
-    {
-      auto cfg = _bus_instance.config();
-
-      cfg.spi_host = SPI2_HOST;
-      cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
-      cfg.freq_read = 16000000;
-      cfg.spi_3wire = false;
-
-      cfg.pin_sclk = Pins::LCD_SCLK;
-      cfg.pin_mosi = Pins::LCD_MOSI;
-      cfg.pin_miso = Pins::LCD_MISO;
-      cfg.pin_dc = Pins::LCD_DC;
-
-      _bus_instance.config(cfg);
-      _panel_instance.setBus(&_bus_instance);
-    }
-
-    {
-      auto cfg = _panel_instance.config();
-
-      cfg.pin_cs = Pins::LCD_CS;
-      cfg.pin_rst = -1;
-      cfg.pin_busy = -1;
-
-      cfg.panel_width = 240;
-      cfg.panel_height = 320;
-      cfg.offset_x = 0;
-      cfg.offset_y = 0;
-      cfg.offset_rotation = 0;
-      cfg.dummy_read_pixel = 8;
-      cfg.readable = true;
-      cfg.invert = false;
-      cfg.rgb_order = false;
-
-      _panel_instance.config(cfg);
-    }
-
-    {
-      auto cfg = _light_instance.config();
-
-      cfg.pin_bl = Pins::LCD_BL;
-
-      _light_instance.config(cfg);
-      _panel_instance.setLight(&_light_instance);
-    }
-
-    setPanel(&_panel_instance);
-  }
-};
-
-class FileSystem
-{
-public:
-  inline static std::vector<Track> _tracks;
-  // Dedicated SPI bus for the SD card. The LCD (LovyanGFX) owns the default
-  // SPI2/FSPI host, so the SD card gets SPI3/HSPI to avoid both drivers
-  // fighting over one host with different pins.
-  inline static SPIClass _sdSpi = SPIClass(HSPI);
-
-  static bool initSD()
-  {
-    // Deselect both SPI devices before touching the bus so the LCD
-    // (already initialized) cannot answer to SD traffic.
-    pinMode(Pins::LCD_CS, OUTPUT);
-    digitalWrite(Pins::LCD_CS, HIGH);
-    pinMode(Pins::SD_CS, OUTPUT);
-    digitalWrite(Pins::SD_CS, HIGH);
-    // Give the card time to power up after the ESP32 booted.
-    delay(500);
-    _sdSpi.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
-    // Retry mount, stepping the SPI clock down: marginal wiring that
-    // fails at 10 MHz often works at 4 MHz or 1 MHz.
-    static constexpr uint32_t kSpeeds[] = {10000000, 4000000, 1000000};
-    for (uint8_t attempt = 0; attempt < 5; ++attempt)
-    {
-      uint32_t freq = kSpeeds[attempt < 3 ? attempt : 2];
-      Serial.printf("[SD] Mount attempt %u at %lu Hz...\n", attempt + 1, (unsigned long)freq);
-      digitalWrite(Pins::SD_CS, HIGH);
-      delay(100);
-      if (SD.begin(Pins::SD_CS, _sdSpi, freq))
-        return true;
-      Serial.println("[SD] Attempt failed, retrying...");
-      delay(300);
-    }
-    return false;
-  }
-
-  static void scan(const char *rootPath = "/")
-  {
-    _tracks.clear();
-    File root = SD.open(rootPath);
-    if (!root || !root.isDirectory())
-    {
-      Serial.printf("[FS] Failed to open directory: %s\n", rootPath);
-      return;
-    }
-    scanDirectory(root);
-  }
-
-private:
-  static void scanDirectory(File &dir, uint8_t depth = 0)
-  {
-    File entry = dir.openNextFile();
-    while (entry)
-    {
-      String name = String(entry.name());
-      int slashIdx = name.lastIndexOf('/');
-      String cleanName = (slashIdx >= 0) ? name.substring(slashIdx + 1) : name;
-
-      String lowerName = cleanName;
-      lowerName.toLowerCase();
-
-      if (entry.isDirectory())
-      {
-        if (cleanName != "." && cleanName != ".." && cleanName.indexOf("System Volume") < 0 && cleanName.indexOf("$RECYCLE") < 0)
-        {
-          scanDirectory(entry, depth + 1);
-        }
-      }
-      else if (lowerName.endsWith(".mp3") || lowerName.endsWith(".wav") || lowerName.endsWith(".flac") || lowerName.endsWith(".m4a"))
-      {
-        String fullPath = entry.path();
-        if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
-        _tracks.push_back({fullPath, cleanName});
-      }
-      entry.close();
-      entry = dir.openNextFile();
-    }
-  }
-};
-
-class KcxController
-{
-public:
-  using DeviceCallback = std::function<void(const BtDevice &)>;
-  using StatusCallback = std::function<void(bool, const String &)>;
-
-  KcxController(uint8_t rxPin, uint8_t txPin)
-      : _rxPin(rxPin), _txPin(txPin), _serial(1) {}
-
-  void begin(uint32_t baud = 115200)
-  {
-    _serial.begin(baud, SERIAL_8N1, _rxPin, _txPin);
-    delay(100);
-    while (_serial.available())
-      _serial.read();
-  }
-
-  void update()
-  {
-    while (_serial.available())
-    {
-      char c = static_cast<char>(_serial.read());
-
-      if (c == '\r')
-        continue;
-
-      if (c == '\n')
-      {
-        _rxBuffer.trim();
-        if (_rxBuffer.length() > 0)
-          parseLine(_rxBuffer);
-        _rxBuffer = "";
-      }
-      else
-      {
-        _rxBuffer += c;
-      }
-    }
-  }
-
-  void sendCommand(const String &cmd)
-  {
-    _serial.print(cmd + "\r\n");
-  }
-
-  void requestVersion()
-  {
-    sendCommand("AT+GMR?");
-  }
-
-  void startScan(bool clearMemory = false)
-  {
-    if (clearMemory)
-    {
-      sendCommand("AT+DELADD=ALL");
-      delay(50);
-    }
-    _seenMacs.clear();
-    sendCommand("AT+DISCON");
-  }
-
-  void disconnect()
-  {
-    sendCommand("AT+DISCON");
-  }
-
-  void connectByMac(const String &rawMac)
-  {
-    String cleanMac = rawMac;
-    cleanMac.replace(":", "");
-    sendCommand("AT+CONADD=" + cleanMac);
-  }
-
-  void connectByName(const String &name)
-  {
-    sendCommand("AT+CONNAME=" + name);
-  }
-
-  void onDeviceFound(DeviceCallback cb)
-  {
-    _onDeviceFound = cb;
-  }
-
-  void onConnectionChange(StatusCallback cb)
-  {
-    _onStatusChange = cb;
-  }
-
-private:
-  uint8_t _rxPin;
-  uint8_t _txPin;
-  HardwareSerial _serial;
-  String _rxBuffer;
-  std::vector<String> _seenMacs;
-  DeviceCallback _onDeviceFound = nullptr;
-  StatusCallback _onStatusChange = nullptr;
-
-  void parseLine(const String &line)
-  {
-    if (line.indexOf("MacAdd:") >= 0 && line.indexOf("Name:") >= 0)
-    {
-      int macIdx = line.indexOf("MacAdd:");
-      int nameIdx = line.indexOf("Name:");
-
-      String mac = line.substring(macIdx + 7, nameIdx);
-      mac.replace(",", "");
-      mac.trim();
-
-      String name = line.substring(nameIdx + 5);
-      name.trim();
-
-      for (const auto &seen : _seenMacs)
-      {
-        if (seen == mac)
-          return;
-      }
-      _seenMacs.push_back(mac);
-
-      String formattedMac;
-      for (size_t i = 0; i < mac.length(); ++i)
-      {
-        formattedMac += mac[i];
-        if ((i % 2 == 1) && (i + 1 < mac.length()))
-          formattedMac += ':';
-      }
-
-      if (_onDeviceFound)
-        _onDeviceFound({name, formattedMac});
-      return;
-    }
-
-    if (line.indexOf("CONNECTED") >= 0 ||
-        line.indexOf("CON MATCH") >= 0 ||
-        line.startsWith("CONNECT=>"))
-    {
-      if (_onStatusChange)
-        _onStatusChange(true, line);
-      return;
-    }
-
-    if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
-    {
-      if (_onStatusChange)
-        _onStatusChange(false, line);
-      return;
-    }
-
-    if (line.indexOf("OK+VERS:") >= 0)
-    {
-      Serial.printf("[KCX] Firmware: %s\n", line.c_str());
-    }
-  }
-};
-
-class ClickWheel
-{
-public:
-  struct State
-  {
-    bool touching;
-    uint8_t position;
-    uint8_t delta;
-    uint8_t buttons;
-    bool btnCenter;
-    bool btnRight;
-    bool btnLeft;
-    bool btnDown;
-    bool btnUp;
-    uint8_t statusByte;
-  };
-
-  using ReportCallback = std::function<void(const State &)>;
-
-  ClickWheel(uint8_t clkPin, uint8_t dataPin)
-      : _clkPin(clkPin), _dataPin(dataPin) {}
-
-  void begin(void (*isr)())
-  {
-    pinMode(_clkPin, INPUT_PULLUP);
-    pinMode(_dataPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(_clkPin), isr, FALLING);
-  }
-
-  void onReport(ReportCallback cb)
-  {
-    _onReport = cb;
-  }
-
-  void update(bool printRaw = false)
-  {
-    if (!_frameReady)
-      return;
-
-    uint8_t frame[4];
-
-    noInterrupts();
-    for (uint8_t i = 0; i < 4; ++i)
-      frame[i] = _frame[i];
-    _frameReady = false;
-    interrupts();
-
-    if (printRaw)
-    {
-      Serial.printf("[Wheel] raw: %02X %02X %02X %02X\n",
-                    frame[0], frame[1], frame[2], frame[3]);
-    }
-
-    State state;
-    state.buttons = frame[1];
-    state.btnCenter = (frame[1] & 0x01) != 0;
-    state.btnRight = (frame[1] & 0x02) != 0;
-    state.btnLeft = (frame[1] & 0x04) != 0;
-    state.btnDown = (frame[1] & 0x08) != 0;
-    state.btnUp = (frame[1] & 0x10) != 0;
-    state.delta = frame[2] - _lastPosition;
-    _lastPosition = frame[2];
-    state.position = frame[2];
-    state.touching = (frame[3] & 0x40) != 0;
-    state.statusByte = frame[3];
-
-    if (_onReport)
-      _onReport(state);
-  }
-
-  void IRAM_ATTR handleEdge()
-  {
-    uint32_t now = micros();
-
-    if ((_byteIndex != 0 || _bitCount != 0) &&
-        (now - _lastEdgeUs) > kFrameGapTimeoutUs)
-    {
-      _shiftByte = 0;
-      _bitCount = 0;
-      _byteIndex = 0;
-    }
-    _lastEdgeUs = now;
-    _edgeCount = _edgeCount + 1;
-
-    uint8_t bit = static_cast<uint8_t>(digitalRead(_dataPin));
-    _shiftByte |= static_cast<uint8_t>(bit << _bitCount);
-    _bitCount = _bitCount + 1;
-
-    if (_bitCount < 8)
-      return;
-
-    if (_byteIndex == 0 && _shiftByte != 0x1A)
-    {
-      _shiftByte = 0;
-      _bitCount = 0;
-      return;
-    }
-
-    _frame[_byteIndex] = _shiftByte;
-    _byteIndex = _byteIndex + 1;
-    _shiftByte = 0;
-    _bitCount = 0;
-
-    if (_byteIndex == 4)
-    {
-      _byteIndex = 0;
-      _frameReady = true;
-    }
-  }
-
-  uint32_t edgeCount() const { return _edgeCount; }
-
-private:
-  uint8_t _clkPin;
-  uint8_t _dataPin;
-  ReportCallback _onReport = nullptr;
-
-  volatile uint8_t _shiftByte = 0;
-  volatile uint8_t _bitCount = 0;
-  volatile uint8_t _byteIndex = 0;
-  volatile uint8_t _frame[4] = {0, 0, 0, 0};
-  volatile bool _frameReady = false;
-
-  volatile uint32_t _lastEdgeUs = 0;
-  volatile uint32_t _edgeCount = 0;
-  uint8_t _lastPosition = 0;
-  static constexpr uint32_t kFrameGapTimeoutUs = 1500;
-};
 
 KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
 ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
-static LGFX lcd;
-
-Audio audio;
-volatile bool shouldRepeatTrack = false;
-volatile int volume = 12;
-// Accumulated wheel motion not yet converted into volume steps.
-// Filled by the wheel report callback, consumed by loopClickWheel().
-volatile int wheelVolumeDelta = 0;
-
-void audioInfoCallback(Audio::msg_t m)
-{
-  if (m.s && m.msg)
-  {
-    Serial.printf("[Audio %s] %s\n", m.s, m.msg);
-  }
-
-  if (m.e == Audio::evt_eof)
-  {
-    Serial.println("[Audio] EOF event detected!");
-    shouldRepeatTrack = true;
-  }
-}
+Screen screen;
+AudioPlayer player;
 
 void IRAM_ATTR clickWheelISR()
 {
@@ -514,25 +46,6 @@ void setupSerial()
   Serial.println("\n=== System Starting ===");
 }
 
-void setupDisplay()
-{
-  lcd.init();
-  lcd.setRotation(3);
-  lcd.setColorDepth(18);
-  lcd.fillScreen(TFT_BLACK);
-  lcd.setTextColor(TFT_YELLOW);
-  lcd.setTextSize(2);
-  lcd.setCursor(20, 20);
-  lcd.println("ILI9341 Display Ready!");
-}
-
-void setupAudio()
-{
-  Audio::audio_info_callback = audioInfoCallback;
-  audio.setPinout(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
-  audio.setVolume(volume);
-}
-
 void setupFileSystem()
 {
   if (FileSystem::initSD())
@@ -541,12 +54,11 @@ void setupFileSystem()
     Serial.printf("[SD] Type: %u, size: %llu MB\n",
                   SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
     FileSystem::scan("/");
-    Serial.printf("[FS] Found %u track(s).\n", (unsigned)FileSystem::_tracks.size());
-    if (!FileSystem::_tracks.empty())
+    Serial.printf("[FS] Found %u track(s).\n", (unsigned)FileSystem::tracks.size());
+    if (!FileSystem::tracks.empty())
     {
-      bool ok = audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
-      Serial.printf("[Audio] Playing first track: %s (connect %s)\n",
-                    FileSystem::_tracks[0].name.c_str(), ok ? "OK" : "FAILED");
+      player.playFile(FileSystem::tracks[0].path.c_str(),
+                      FileSystem::tracks[0].name.c_str());
     }
     else
     {
@@ -579,7 +91,7 @@ void setupClickWheel()
       // Clamp spikes from noisy frames; the accumulator keeps the rest.
       if (d > 10) d = 10;
       if (d < -10) d = -10;
-      wheelVolumeDelta += d;
+      player.addWheelMotion(d);
     }
     prevPos = state.position;
     prevTouch = state.touching;
@@ -619,85 +131,12 @@ void setupBluetooth()
   bt.startScan(true);
 }
 
-void setup()
-{
-  setupSerial();
-  setupDisplay();
-  setupAudio();
-  setupFileSystem();
-  setupClickWheel();
-  setupBluetooth();
-}
-
-void loopAudio()
-{
-  audio.loop();
-  audio.setVolume(volume);
-
-  if (shouldRepeatTrack)
-  {
-    shouldRepeatTrack = false;
-    if (!FileSystem::_tracks.empty())
-    {
-      Serial.println("[Audio] Restarting track: " + FileSystem::_tracks[0].name);
-      audio.connecttoFS(SD, FileSystem::_tracks[0].path.c_str());
-    }
-  }
-}
-
-void loopDisplay()
-{
-  // Redraw only when something actually changed. Clearing and rewriting
-  // the screen on a timer is what made it visibly blink; untouched
-  // pixels stay exactly as they are now.
-  static String lastTrack = "";
-  static int lastVolume = -1;
-  String track = FileSystem::_tracks.empty() ? "No tracks found." : FileSystem::_tracks[0].name;
-  if (track == lastTrack && volume == lastVolume)
-    return;
-  lastTrack = track;
-  lastVolume = volume;
-  // Repaint just the text area instead of the whole screen.
-  lcd.fillRect(0, 0, lcd.width(), 90, TFT_BLACK);
-  lcd.setCursor(0, 0);
-  lcd.println("Current Track:");
-  lcd.println(track);
-  lcd.setCursor(0, 60);
-  lcd.printf("Volume: %d\n", volume);
-}
-
-void loopBluetooth()
-{
-  bt.update();
-}
-
 void loopClickWheel()
 {
   wheel.update(true);
 
   static unsigned long lastWheelDiag = 0;
   static uint32_t lastDiagEdgeCount = 0;
-  // Fractional accumulation: 1 volume step per 4 wheel units. The leftover
-  // remainder is kept, so slow turns still register smoothly and fast
-  // spins don't overshoot in one jump.
-  static int volRemainder = 0;
-  noInterrupts();
-  int dv = wheelVolumeDelta;
-  wheelVolumeDelta = 0;
-  interrupts();
-  if (dv != 0)
-  {
-    volRemainder += dv;
-    int steps = volRemainder / 4;
-    if (steps != 0)
-    {
-      volRemainder -= steps * 4;
-      volume = volume + steps;
-      if (volume < 0) volume = 0;
-      if (volume > 21) volume = 21;
-      Serial.printf("[Audio] Volume: %d\n", volume);
-    }
-  }
   if (millis() - lastWheelDiag > 2000)
   {
     lastWheelDiag = millis();
@@ -708,6 +147,12 @@ void loopClickWheel()
                   digitalRead(Pins::CLICK_WAKE));
     lastDiagEdgeCount = edgesNow;
   }
+}
+
+void loopDisplay()
+{
+  String track = FileSystem::tracks.empty() ? "No tracks found." : FileSystem::tracks[0].name;
+  screen.show(track, player.volume(), bt.statusText());
 }
 
 void loopSerialCommands()
@@ -721,10 +166,22 @@ void loopSerialCommands()
   }
 }
 
+} // namespace
+
+void setup()
+{
+  setupSerial();
+  screen.begin();
+  player.begin(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
+  setupFileSystem();
+  setupClickWheel();
+  setupBluetooth();
+}
+
 void loop()
 {
-  loopAudio();
-  loopBluetooth();
+  player.update();
+  bt.update();
   loopClickWheel();
   loopDisplay();
   loopSerialCommands();
