@@ -315,7 +315,19 @@ void loopSerialCommands()
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     if (cmd.length() > 0)
+    {
+      if (cmd == "state")
+      {
+        Serial.printf("[STATE] bt=%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
+                      bt.connected() ? "UP" : "DOWN", bt.peerName().c_str(),
+                      (int)bt.connectPending(), (unsigned)bt.seenDeviceCount(),
+                      (unsigned)bt.linkedMacs().size(), selectedMac.c_str());
+        for (const auto &m : bt.linkedMacs())
+          Serial.printf("[STATE] table: %s\n", m.c_str());
+        return;
+      }
       bt.sendCommand(cmd);
+    }
   }
 }
 
