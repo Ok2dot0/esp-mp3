@@ -170,22 +170,40 @@ void setupBluetooth()
     Serial.println("[BT] Module ready.");
   else
     Serial.println("[BT] Module not answering, continuing anyway.");
-  // Phone-like fresh start: forget everything, then store a sentinel
-  // that matches no real device. A non-empty table makes the module
-  // link ONLY listed devices, so scan hits get listed but never
-  // auto-connected until the user picks them.
+  // Pairings persist in module flash across ESP reboots on purpose:
+  // the module holds (and re-links) remembered devices by itself.
+  // Only a factory-fresh, empty table gets the sentinel so it cannot
+  // grab the first device found before the user picks anything.
   // Pacing matters throughout: the module handles one command at a time.
-  Serial.println("[BT] Forgetting old pairings...");
-  bt.clearPairings();
-  bt.pump(800);
-  bt.storeDevice(KcxController::kSentinelMac);
-  bt.pump(600);
-  // Learn the stored auto-link table (decides what may connect),
-  // then (re)start discovery.
   bt.queryLinks();
-  bt.pump(600);
-  Serial.println("[BT] Starting scan...");
-  bt.startScan();
+  bt.pump(1000);
+  if (bt.linkedMacs().empty())
+  {
+    Serial.println("[BT] Table empty, storing sentinel guard.");
+    bt.storeDevice(KcxController::kSentinelMac);
+    bt.pump(600);
+  }
+  else
+  {
+    Serial.printf("[BT] Table holds %u device(s).\n", (unsigned)bt.linkedMacs().size());
+  }
+  // Sync with a link the module may still hold (an ESP reboot does not
+  // drop it): two paced polls let the debounce heal the flag. Rescan
+  // only when actually down, never blindly.
+  bt.sendCommand("AT+STATUS?");
+  bt.pump(400);
+  bt.sendCommand("AT+STATUS?");
+  bt.pump(400);
+  if (!bt.connected())
+  {
+    Serial.println("[BT] Starting scan...");
+    bt.startScan();
+  }
+  else
+  {
+    Serial.println("[BT] Link still up, skipping rescan.");
+  }
+  bt.setPolling(true);
 }
 
 void loopClickWheel()

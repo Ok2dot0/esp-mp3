@@ -12,19 +12,18 @@ struct BtDevice
 };
 
 // Driver for the KCX BT emitter module (AT commands over UART).
-// Pairing model (per KCX reference behavior): the module keeps an
-// auto-link table (up to 10 MACs). With a non-empty table it connects
-// only to listed devices; with an empty table it takes the first
-// device found. There is no direct-dial command, so "connect" means
-// "store in the table and (re)scan". Tracks connection state so the
-// UI can show it without extra wiring.
+// Pairing model (reference behavior): the module keeps an auto-link
+// table (up to 10 MACs, persisted in module flash). It links table
+// entries on sightings and holds the link independently of the ESP32,
+// so an ESP reboot must NOT wipe the table or rescan blindly — sync
+// with the live state instead. Tracks connection state so the UI can
+// show it without extra wiring.
 class KcxController
 {
 public:
-  // Fake table entry that matches no real device. A non-empty auto-link
-  // table makes the module link ONLY listed devices, so keeping this
-  // sentinel stored gates promiscuous first-found auto-connects while
-  // the user picks from the scan list.
+  // Fake table entry that matches no real device. Stored only when the
+  // table would otherwise be empty, so a fresh module cannot grab the
+  // first device found before the user picks anything.
   static constexpr const char *kSentinelMac = "deadbeefcafe";
 
   using DeviceCallback = std::function<void(const BtDevice &)>;
@@ -40,8 +39,11 @@ public:
   bool waitReady(unsigned long timeoutMs = 8000);
   bool ready() const { return ready_; }
   // Pumps UART traffic; also polls link status every few seconds so a
-  // silently dropped link (headphones walked away) is noticed.
+  // silently dropped link (headphones walked away) is noticed. The
+  // poll only runs after setPolling(true) (end of setup), so paced
+  // setup commands never collide with it.
   void update();
+  void setPolling(bool on);
   // Pump traffic for ms milliseconds (lets multi-line answers arrive
   // before the next command: the module handles one command at a time).
   void pump(unsigned long ms);
@@ -97,10 +99,16 @@ private:
   bool connectPending_ = false;
   bool ready_ = false;
   bool versionSeen_ = false;
+  bool polling_ = false;
   // Consecutive disagreeing STATUS polls. A single poll can sample the
   // link mid-transition (stale), so only repeated agreement flips the
   // state. Real CONNECT/DISCONNECT lines always act immediately.
   uint8_t statusMismatch_ = 0;
+  // millis() of the last event-driven link-up. STATUS:0 readings inside
+  // the grace window are ignored: the register lags a fresh link by
+  // many seconds and would otherwise flap the UI straight back down.
+  unsigned long lastLinkUpMs_ = 0;
+  static constexpr unsigned long kLinkUpGraceMs = 15000;
   String peerName_;
   String lastFoundName_;
   unsigned long lastStatusPoll_ = 0;

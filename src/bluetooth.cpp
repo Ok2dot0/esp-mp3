@@ -53,12 +53,19 @@ void KcxController::update()
   }
 
   // Poll the link state so a silently dropped link (device walked away,
-  // no UART event) is noticed within seconds.
-  if (ready_ && millis() - lastStatusPoll_ > kStatusPollMs)
+  // no UART event) is noticed within seconds. Gated until setup is done
+  // so paced setup commands never collide with it.
+  if (polling_ && ready_ && millis() - lastStatusPoll_ > kStatusPollMs)
   {
     lastStatusPoll_ = millis();
     sendCommand("AT+STATUS?");
   }
+}
+
+void KcxController::setPolling(bool on)
+{
+  polling_ = on;
+  lastStatusPoll_ = millis();
 }
 
 void KcxController::pump(unsigned long ms)
@@ -276,12 +283,18 @@ void KcxController::parseLine(const String &line)
   // Link poll answers, e.g. "OK+STATUS:1". Debounced: one poll can
   // catch the link mid-transition, so two in a row must agree before
   // the state flips. CONNECT/DISCONNECT lines bypass this entirely.
+  // Fresh links also get a grace window: the register keeps reading 0
+  // for many seconds after a real link-up.
   if (line.startsWith("OK+STATUS:"))
   {
     bool up = line.endsWith("1");
     if (up == connected_)
     {
       statusMismatch_ = 0;
+    }
+    else if (!up && millis() - lastLinkUpMs_ < kLinkUpGraceMs)
+    {
+      // Ignore: link just came up, register hasn't caught up yet.
     }
     else if (++statusMismatch_ >= 2)
     {
@@ -301,6 +314,7 @@ void KcxController::parseLine(const String &line)
       line.indexOf("CONNECTED") >= 0)
   {
     statusMismatch_ = 0;
+    lastLinkUpMs_ = millis();
     if (!lastFoundName_.isEmpty())
       peerName_ = lastFoundName_;
     setConnected(true, line);
