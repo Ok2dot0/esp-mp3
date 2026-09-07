@@ -82,15 +82,32 @@ void Screen::begin()
 }
 
 void Screen::show(const String &trackName, int volume, const String &btStatus)
-{
-  if (trackName == lastTrack_ && volume == lastVolume_ && btStatus == lastBt_)
+{  if (trackName == lastTrack_ && volume == lastVolume_ && btStatus == lastBt_)
     return; // Nothing changed: leave the pixels alone (no blink).
+  Serial.printf("[DSP] now-playing repaint: track='%s' vol=%d bt='%s' heap=%u\n",
+                trackName.c_str(), volume, btStatus.c_str(), (unsigned)ESP.getFreeHeap());
   lastTrack_ = trackName;
   lastVolume_ = volume;
   lastBt_ = btStatus;
   // Invalidate the list-view cache so switching views repaints.
   lastListSig_ = "\x01";
   repaint(trackName, volume, btStatus);
+  Serial.println("[DSP] now-playing repaint done");
+}
+
+void Screen::message(const String &line1, const String &line2)
+{
+  // Invalidate both view caches so the next regular repaint happens.
+  lastTrack_ = "\x02";
+  lastListSig_ = "\x02";
+  lcd.fillRect(0, 0, lcd.width(), 120, TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println(line1);
+  if (!line2.isEmpty())
+  {
+    lcd.setCursor(0, 20);
+    lcd.println(line2);
+  }
 }
 
 void Screen::repaint(const String &trackName, int volume, const String &btStatus)
@@ -114,10 +131,12 @@ void Screen::showDevices(const std::vector<BtDevice> &devices, int selected, con
     sig += d.name + "," + d.mac + ";";
   if (sig == lastListSig_)
     return;
+  Serial.printf("[DSP] list repaint: sig='%s' heap=%u\n", sig.c_str(), (unsigned)ESP.getFreeHeap());
   lastListSig_ = sig;
   // Invalidate the now-playing cache so switching views repaints.
   lastTrack_ = "\x01";
   repaintDevices(devices, selected, footer);
+  Serial.println("[DSP] list repaint done");
 }
 
 void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected, const String &footer)

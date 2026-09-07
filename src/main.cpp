@@ -324,8 +324,10 @@ void setup()
 {
   setupSerial();
   screen.begin();
+  screen.message("Starting...", "Mounting SD");
   player.begin(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
   setupFileSystem();
+  screen.message("Starting...", "Waiting for BT");
   setupClickWheel();
   setupButtons();
   setupBluetooth();

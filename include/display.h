@@ -15,6 +15,10 @@ public:
   // did not change since the last call costs zero SPI traffic.
   void show(const String &trackName, int volume, const String &btStatus);
 
+  // Immediate one-shot message (boot progress etc.). Bypasses the
+  // change cache; the next show()/showDevices() repaints over it.
+  void message(const String &line1, const String &line2 = "");
+
   // Bluetooth pairing view: discovered devices with a highlighted
   // selection, plus a status footer. Same change-only repaint policy.
   void showDevices(const std::vector<BtDevice> &devices, int selected, const String &footer);
