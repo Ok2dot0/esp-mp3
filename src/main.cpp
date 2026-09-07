@@ -157,7 +157,11 @@ void setupBluetooth()
   });
 
   bt.begin();
-  bt.requestVersion();
+  Serial.println("[BT] Waiting for module...");
+  if (bt.waitReady())
+    Serial.println("[BT] Module ready.");
+  else
+    Serial.println("[BT] Module not answering, continuing anyway.");
   Serial.println("[BT] Starting clean scan...");
   bt.startScan(true);
 }
@@ -231,8 +235,13 @@ void loopBtMenu()
     wheelMotion = 0;
     if (bootButtonPressed())
     {
-      Serial.println("[BT] Disconnect requested.");
+      Serial.println("[BTN] BOOT pressed while connected.");
+      // Disconnect AND forget the pairing: otherwise the module
+      // auto-relinks to the remembered device seconds later.
+      Serial.println("[BT] Disconnect requested, forgetting pairing.");
       bt.disconnect();
+      delay(300);
+      bt.clearPairings();
     }
     return;
   }
@@ -255,11 +264,19 @@ void loopBtMenu()
     sel = selectedDeviceIndex();
   }
 
-  if (bootButtonPressed() && sel >= 0)
+  if (bootButtonPressed())
   {
-    Serial.printf("[BT] Connecting to %s (%s)...\n",
-                  devs[(size_t)sel].name.c_str(), devs[(size_t)sel].mac.c_str());
-    bt.connectByMac(devs[(size_t)sel].mac);
+    if (sel >= 0)
+    {
+      Serial.printf("[BTN] BOOT pressed, sel=%d.\n", sel);
+      Serial.printf("[BT] Connecting to %s (%s)...\n",
+                    devs[(size_t)sel].name.c_str(), devs[(size_t)sel].mac.c_str());
+      bt.connectByMac(devs[(size_t)sel].mac);
+    }
+    else
+    {
+      Serial.println("[BTN] BOOT pressed, but the device list is empty.");
+    }
   }
 
   screen.showDevices(devs, sel, bt.statusText());

@@ -21,14 +21,24 @@ public:
   KcxController(uint8_t rxPin, uint8_t txPin);
 
   void begin(uint32_t baud = 115200);
+  // Pings the module until it answers OK+, then asks for its version.
+  // The module needs a few seconds after power-on before real commands
+  // work (early ones die silently or with CMD ERR), so boot waits here.
+  // Returns true once the module answered both.
+  bool waitReady(unsigned long timeoutMs = 8000);
+  bool ready() const { return ready_; }
   void update();
 
   void sendCommand(const String &cmd);
   void requestVersion();
   void startScan(bool clearMemory = false);
   void disconnect();
+  // Saves the device in the module's auto-link memory; the module
+  // connects by itself once the device is found ("CON MATCH ADD").
   void connectByMac(const String &rawMac);
   void connectByName(const String &name);
+  // Forgets all auto-link pairings (module stops auto-reconnecting).
+  void clearPairings();
 
   void onDeviceFound(DeviceCallback cb);
   void onConnectionChange(StatusCallback cb);
@@ -52,6 +62,8 @@ private:
 
   bool connected_ = false;
   bool connectPending_ = false;
+  bool ready_ = false;
+  bool versionSeen_ = false;
   String peerName_;
   String lastFoundName_;
 

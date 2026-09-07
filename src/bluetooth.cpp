@@ -11,6 +11,26 @@ void KcxController::begin(uint32_t baud)
     serial_.read();
 }
 
+bool KcxController::waitReady(unsigned long timeoutMs)
+{
+  unsigned long start = millis();
+  sendCommand("AT+");
+  while (!ready_ && millis() - start < timeoutMs)
+  {
+    update();
+    delay(50);
+  }
+  if (!ready_)
+    return false;
+  sendCommand("AT+GMR?");
+  while (!versionSeen_ && millis() - start < timeoutMs)
+  {
+    update();
+    delay(50);
+  }
+  return versionSeen_;
+}
+
 void KcxController::update()
 {
   while (serial_.available())
@@ -36,6 +56,7 @@ void KcxController::update()
 
 void KcxController::sendCommand(const String &cmd)
 {
+  Serial.printf("[KCX] >> %s\n", cmd.c_str());
   serial_.print(cmd + "\r\n");
 }
 
@@ -48,12 +69,21 @@ void KcxController::startScan(bool clearMemory)
 {
   if (clearMemory)
   {
-    sendCommand("AT+DELADD=ALL");
-    delay(50);
+    // Delete stored auto-link pairings so the module does not reconnect
+    // to old devices by itself. This alone re-triggers the scan
+    // (module answers Delete_Vmlink + SCAN), so no follow-up command:
+    // sending one too fast only yields CMD ERR.
+    sendCommand("AT+DELVMLINK");
+    delay(500);
   }
   seen_.clear();
   connectPending_ = false;
-  sendCommand("AT+DISCON");
+}
+
+void KcxController::clearPairings()
+{
+  sendCommand("AT+DELVMLINK");
+  delay(500);
 }
 
 void KcxController::disconnect()
@@ -66,12 +96,13 @@ void KcxController::connectByMac(const String &rawMac)
   String cleanMac = rawMac;
   cleanMac.replace(":", "");
   connectPending_ = true;
-  sendCommand("AT+CONADD=" + cleanMac);
+  sendCommand("AT+ADDLINKADD=" + cleanMac);
 }
 
 void KcxController::connectByName(const String &name)
 {
-  sendCommand("AT+CONNAME=" + name);
+  connectPending_ = true;
+  sendCommand("AT+ADDLINKNAME=" + name);
 }
 
 void KcxController::onDeviceFound(DeviceCallback cb)
@@ -97,6 +128,12 @@ String KcxController::statusText() const
 
 void KcxController::parseLine(const String &line)
 {
+  Serial.printf("[KCX] << %s\n", line.c_str());
+  if (line == "OK+")
+  {
+    ready_ = true;
+    return;
+  }
   if (line.indexOf("MacAdd:") >= 0 && line.indexOf("Name:") >= 0)
   {
     int macIdx = line.indexOf("MacAdd:");
@@ -110,18 +147,19 @@ void KcxController::parseLine(const String &line)
     name.trim();
     lastFoundName_ = name;
 
-    for (const auto &seen : seen_)
-    {
-      if (seen.mac == mac)
-        return;
-    }
-
     String formattedMac;
     for (size_t i = 0; i < mac.length(); ++i)
     {
       formattedMac += mac[i];
       if ((i % 2 == 1) && (i + 1 < mac.length()))
         formattedMac += ':';
+    }
+
+    // Compare formatted MACs: the stored entries keep colons.
+    for (const auto &seen : seen_)
+    {
+      if (seen.mac == formattedMac)
+        return;
     }
     seen_.push_back({name, formattedMac});
 
@@ -130,9 +168,13 @@ void KcxController::parseLine(const String &line)
     return;
   }
 
-  if (line.indexOf("CONNECTED") >= 0 ||
-      line.indexOf("CON MATCH") >= 0 ||
-      line.startsWith("CONNECT=>"))
+  // Connect indications per the KCX protocol (see KCX_BT_Emitter lib):
+  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD".
+  if (line.startsWith("CONNECT") ||
+      line.startsWith("CON ONE") ||
+      line.startsWith("CON LAST") ||
+      line.startsWith("CON MATCH") ||
+      line.indexOf("CONNECTED") >= 0)
   {
     connected_ = true;
     connectPending_ = false;
@@ -154,6 +196,7 @@ void KcxController::parseLine(const String &line)
 
   if (line.indexOf("OK+VERS:") >= 0)
   {
+    versionSeen_ = true;
     Serial.printf("[KCX] Firmware: %s\n", line.c_str());
   }
 }
