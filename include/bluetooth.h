@@ -7,7 +7,8 @@
 struct BtDevice
 {
   String name;
-  String mac;
+  String mac; // Formatted with colons, e.g. "ab:b0:49:ed:c2:50".
+  unsigned long lastSeen = 0; // millis() of the last scan sighting.
 };
 
 // Driver for the KCX BT emitter module (AT commands over UART).
@@ -20,6 +21,12 @@ struct BtDevice
 class KcxController
 {
 public:
+  // Fake table entry that matches no real device. A non-empty auto-link
+  // table makes the module link ONLY listed devices, so keeping this
+  // sentinel stored gates promiscuous first-found auto-connects while
+  // the user picks from the scan list.
+  static constexpr const char *kSentinelMac = "deadbeefcafe";
+
   using DeviceCallback = std::function<void(const BtDevice &)>;
   using StatusCallback = std::function<void(bool, const String &)>;
 
@@ -47,12 +54,18 @@ public:
   // Disconnect + rescan for devices.
   void startScan();
   void disconnect();
-  // Store the device in the module's auto-link table; the module links
-  // it on the next sighting. No-op when already stored (just rescans).
+  // Store the device in the module's auto-link table without asking it
+  // to link right now. No-op when already stored.
+  void storeDevice(const String &macNoColons);
+  // Store the device (unless known) and wait for the module to link it
+  // on sight. No extra scan is kicked: the module scans continuously.
   void connectByMac(const String &rawMac);
   void connectByName(const String &name);
   // Forgets all auto-link pairings (module stops auto-reconnecting).
   void clearPairings();
+  // Drops scan entries not re-seen for maxAgeMs. Returns dropped count.
+  // The module re-reports visible devices, so only gone ones vanish.
+  size_t pruneDevices(unsigned long maxAgeMs);
 
   void onDeviceFound(DeviceCallback cb);
   void onConnectionChange(StatusCallback cb);

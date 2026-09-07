@@ -114,15 +114,32 @@ void KcxController::connectByMac(const String &rawMac)
   cleanMac.replace(":", "");
   cleanMac.toLowerCase();
   connectPending_ = true;
-  if (isLinked(cleanMac))
+  if (!isLinked(cleanMac))
+    sendCommand("AT+ADDLINKADD=" + cleanMac);
+  // No scan kick: the module scans continuously and links stored
+  // devices on sight. Pacing matters (one command at a time).
+}
+
+void KcxController::storeDevice(const String &macNoColons)
+{
+  String cleanMac = macNoColons;
+  cleanMac.toLowerCase();
+  if (!isLinked(cleanMac))
+    sendCommand("AT+ADDLINKADD=" + cleanMac);
+}
+
+size_t KcxController::pruneDevices(unsigned long maxAgeMs)
+{
+  size_t before = seen_.size();
+  unsigned long now = millis();
+  for (auto it = seen_.begin(); it != seen_.end();)
   {
-    // Already in the auto-link table: kick a fresh scan and the module
-    // links it on sight, without storing yet another duplicate.
-    Serial.println("[BT] Already paired, rescanning to link.");
-    sendCommand("AT+PAIR");
-    return;
+    if (now - it->lastSeen > maxAgeMs)
+      it = seen_.erase(it);
+    else
+      ++it;
   }
-  sendCommand("AT+ADDLINKADD=" + cleanMac);
+  return before - seen_.size();
 }
 
 void KcxController::connectByName(const String &name)
@@ -204,12 +221,19 @@ void KcxController::parseLine(const String &line)
     }
 
     // Compare formatted MACs: the stored entries keep colons.
-    for (const auto &seen : seen_)
+    // Re-sightings refresh the timestamp so present devices survive
+    // pruning while gone ones expire.
+    for (auto &seen : seen_)
     {
       if (seen.mac == formattedMac)
+      {
+        seen.lastSeen = millis();
+        if (seen.name != name)
+          seen.name = name;
         return;
+      }
     }
-    seen_.push_back({name, formattedMac});
+    seen_.push_back({name, formattedMac, millis()});
 
     if (onDeviceFound_)
       onDeviceFound_({name, formattedMac});

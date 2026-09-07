@@ -151,9 +151,17 @@ void setupBluetooth()
   bt.onConnectionChange([](bool connected, const String &)
   {
     if (connected)
+    {
       Serial.println("[BT] Status: Connected to audio sink.");
+    }
     else
+    {
+      // Link lost: drop the scan list with it (entries would be ghosts
+      // otherwise) and rescan so the screen rebuilds from sightings.
       Serial.println("[BT] Status: Disconnected / Scanning.");
+      selectedMac = "";
+      bt.startScan();
+    }
   });
 
   bt.begin();
@@ -162,12 +170,20 @@ void setupBluetooth()
     Serial.println("[BT] Module ready.");
   else
     Serial.println("[BT] Module not answering, continuing anyway.");
-  // Learn the stored auto-link table (decides what may connect),
-  // then (re)start discovery. Nothing is wiped: pairings persist.
-  // Pacing matters: the module handles one command at a time, so let
-  // the multi-line table dump arrive before sending the next command.
-  bt.queryLinks();
+  // Phone-like fresh start: forget everything, then store a sentinel
+  // that matches no real device. A non-empty table makes the module
+  // link ONLY listed devices, so scan hits get listed but never
+  // auto-connected until the user picks them.
+  // Pacing matters throughout: the module handles one command at a time.
+  Serial.println("[BT] Forgetting old pairings...");
+  bt.clearPairings();
   bt.pump(800);
+  bt.storeDevice(KcxController::kSentinelMac);
+  bt.pump(600);
+  // Learn the stored auto-link table (decides what may connect),
+  // then (re)start discovery.
+  bt.queryLinks();
+  bt.pump(600);
   Serial.println("[BT] Starting scan...");
   bt.startScan();
 }
@@ -251,6 +267,11 @@ void loopBtMenu()
   }
 
   const auto &devs = bt.seenDevices();
+  // Forget devices gone quiet: the module re-reports visible ones, so
+  // only switched-off/out-of-range entries vanish (no ghosts).
+  size_t dropped = bt.pruneDevices(15000);
+  if (dropped > 0)
+    Serial.printf("[BT] Forgot %u stale device(s).\n", (unsigned)dropped);
   int sel = selectedDeviceIndex();
   if (sel < 0)
     sel = 0;
