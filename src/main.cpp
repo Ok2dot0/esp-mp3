@@ -162,8 +162,14 @@ void setupBluetooth()
     Serial.println("[BT] Module ready.");
   else
     Serial.println("[BT] Module not answering, continuing anyway.");
-  Serial.println("[BT] Starting clean scan...");
-  bt.startScan(true);
+  // Learn the stored auto-link table (decides what may connect),
+  // then (re)start discovery. Nothing is wiped: pairings persist.
+  // Pacing matters: the module handles one command at a time, so let
+  // the multi-line table dump arrive before sending the next command.
+  bt.queryLinks();
+  bt.pump(800);
+  Serial.println("[BT] Starting scan...");
+  bt.startScan();
 }
 
 void loopClickWheel()
@@ -236,12 +242,10 @@ void loopBtMenu()
     if (bootButtonPressed())
     {
       Serial.println("[BTN] BOOT pressed while connected.");
-      // Disconnect AND forget the pairing: otherwise the module
-      // auto-relinks to the remembered device seconds later.
-      Serial.println("[BT] Disconnect requested, forgetting pairing.");
+      // Note: the module re-links remembered devices by itself, so it
+      // may come straight back if the peer is still around.
+      Serial.println("[BT] Disconnect requested.");
       bt.disconnect();
-      delay(300);
-      bt.clearPairings();
     }
     return;
   }
@@ -253,13 +257,13 @@ void loopBtMenu()
   setSelectedDevice(sel);
   sel = selectedDeviceIndex();
 
-  // Wheel scroll: one entry per 8 motion units, remainder kept.
+  // Wheel scroll: one entry per 4 motion units, remainder kept.
   listScrollRemainder += wheelMotion;
   wheelMotion = 0;
-  int steps = listScrollRemainder / 8;
+  int steps = listScrollRemainder / 4;
   if (steps != 0)
   {
-    listScrollRemainder -= steps * 8;
+    listScrollRemainder -= steps * 4;
     setSelectedDevice(sel + steps);
     sel = selectedDeviceIndex();
   }

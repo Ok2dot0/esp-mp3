@@ -30,7 +30,6 @@ bool KcxController::waitReady(unsigned long timeoutMs)
   }
   return versionSeen_;
 }
-
 void KcxController::update()
 {
   while (serial_.available())
@@ -52,6 +51,24 @@ void KcxController::update()
       rxBuffer_ += c;
     }
   }
+
+  // Poll the link state so a silently dropped link (device walked away,
+  // no UART event) is noticed within seconds.
+  if (ready_ && millis() - lastStatusPoll_ > kStatusPollMs)
+  {
+    lastStatusPoll_ = millis();
+    sendCommand("AT+STATUS?");
+  }
+}
+
+void KcxController::pump(unsigned long ms)
+{
+  unsigned long start = millis();
+  while (millis() - start < ms)
+  {
+    update();
+    delay(10);
+  }
 }
 
 void KcxController::sendCommand(const String &cmd)
@@ -65,19 +82,19 @@ void KcxController::requestVersion()
   sendCommand("AT+GMR?");
 }
 
-void KcxController::startScan(bool clearMemory)
+void KcxController::queryLinks()
 {
-  if (clearMemory)
-  {
-    // Delete stored auto-link pairings so the module does not reconnect
-    // to old devices by itself. This alone re-triggers the scan
-    // (module answers Delete_Vmlink + SCAN), so no follow-up command:
-    // sending one too fast only yields CMD ERR.
-    sendCommand("AT+DELVMLINK");
-    delay(500);
-  }
+  sendCommand("AT+VMLINK?");
+}
+
+void KcxController::startScan()
+{
+  // AT+PAIR drops any link and (re)starts discovery (answers OK+PAIR,
+  // then SCAN... and MacAdd lines). No memory wipe: the auto-link table
+  // decides what the module may connect to.
   seen_.clear();
   connectPending_ = false;
+  sendCommand("AT+PAIR");
 }
 
 void KcxController::clearPairings()
@@ -95,7 +112,16 @@ void KcxController::connectByMac(const String &rawMac)
 {
   String cleanMac = rawMac;
   cleanMac.replace(":", "");
+  cleanMac.toLowerCase();
   connectPending_ = true;
+  if (isLinked(cleanMac))
+  {
+    // Already in the auto-link table: kick a fresh scan and the module
+    // links it on sight, without storing yet another duplicate.
+    Serial.println("[BT] Already paired, rescanning to link.");
+    sendCommand("AT+PAIR");
+    return;
+  }
   sendCommand("AT+ADDLINKADD=" + cleanMac);
 }
 
@@ -115,10 +141,32 @@ void KcxController::onConnectionChange(StatusCallback cb)
   onStatusChange_ = cb;
 }
 
+bool KcxController::isLinked(const String &macNoColons) const
+{
+  String needle = macNoColons;
+  needle.toLowerCase();
+  for (const auto &mac : linkedMacs_)
+  {
+    if (mac == needle)
+      return true;
+  }
+  return false;
+}
+
+void KcxController::setConnected(bool connected, const String &detail)
+{
+  if (connected_ == connected)
+    return;
+  connected_ = connected;
+  connectPending_ = false;
+  if (onStatusChange_)
+    onStatusChange_(connected, detail);
+}
+
 String KcxController::statusText() const
 {
   if (connected_)
-    return "BT: " + peerName_;
+    return "BT: " + (peerName_.isEmpty() ? String("connected") : peerName_);
   if (connectPending_)
     return "BT: connecting...";
   if (!seen_.empty())
@@ -168,29 +216,65 @@ void KcxController::parseLine(const String &line)
     return;
   }
 
+  // Auto-link table entries, e.g. "MEM_MacAdd 00:abb049edc250".
+  if (line.startsWith("MEM_MacAdd"))
+  {
+    int colon = line.lastIndexOf(':');
+    if (colon > 0)
+    {
+      String mac = line.substring(colon + 1);
+      mac.trim();
+      mac.toLowerCase();
+      if (!mac.isEmpty() && !isLinked(mac))
+      {
+        linkedMacs_.push_back(mac);
+        Serial.printf("[BT] Paired device remembered: %s\n", mac.c_str());
+      }
+    }
+    return;
+  }
+
+  // Last auto-linked device, e.g. "Auto_link_Add:abb049edc250" (or null).
+  // Counts as a table entry: the module re-links it by itself.
+  if (line.startsWith("Auto_link_Add:"))
+  {
+    String mac = line.substring(14);
+    mac.trim();
+    mac.toLowerCase();
+    if (!mac.isEmpty() && mac != "null" && !isLinked(mac))
+    {
+      linkedMacs_.push_back(mac);
+      Serial.printf("[BT] Paired device remembered: %s\n", mac.c_str());
+    }
+    return;
+  }
+
+  // Link poll answers, e.g. "OK+STATUS:1".
+  if (line.startsWith("OK+STATUS:"))
+  {
+    bool up = line.endsWith("1");
+    setConnected(up, line);
+    return;
+  }
+
   // Connect indications per the KCX protocol (see KCX_BT_Emitter lib):
-  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD".
+  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD", "CON:0x...".
   if (line.startsWith("CONNECT") ||
       line.startsWith("CON ONE") ||
       line.startsWith("CON LAST") ||
       line.startsWith("CON MATCH") ||
+      line.startsWith("CON:") ||
       line.indexOf("CONNECTED") >= 0)
   {
-    connected_ = true;
-    connectPending_ = false;
     if (!lastFoundName_.isEmpty())
       peerName_ = lastFoundName_;
-    if (onStatusChange_)
-      onStatusChange_(true, line);
+    setConnected(true, line);
     return;
   }
 
   if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
   {
-    connected_ = false;
-    connectPending_ = false;
-    if (onStatusChange_)
-      onStatusChange_(false, line);
+    setConnected(false, line);
     return;
   }
 
