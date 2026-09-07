@@ -94,6 +94,12 @@ void KcxController::queryLinks()
   sendCommand("AT+VMLINK?");
 }
 
+void KcxController::resetModule()
+{
+  sendCommand("AT+RESET");
+  pump(2500); // POWER ON + first SCAN lines arrive here.
+}
+
 void KcxController::startScan()
 {
   // AT+PAIR drops any link and (re)starts discovery (answers OK+PAIR,
@@ -175,6 +181,21 @@ bool KcxController::isLinked(const String &macNoColons) const
       return true;
   }
   return false;
+}
+
+bool KcxController::hasRealEntries() const
+{
+  for (const auto &mac : linkedMacs_)
+  {
+    if (!mac.equals(kSentinelMac))
+      return true;
+  }
+  return false;
+}
+
+void KcxController::clearSeen()
+{
+  seen_.clear();
 }
 
 void KcxController::setConnected(bool connected, const String &detail)

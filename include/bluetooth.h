@@ -12,12 +12,15 @@ struct BtDevice
 };
 
 // Driver for the KCX BT emitter module (AT commands over UART).
-// Pairing model (reference behavior): the module keeps an auto-link
-// table (up to 10 MACs, persisted in module flash). It links table
-// entries on sightings and holds the link independently of the ESP32,
-// so an ESP reboot must NOT wipe the table or rescan blindly — sync
-// with the live state instead. Tracks connection state so the UI can
-// show it without extra wiring.
+// Link model (manufacturer manual + reference behavior):
+// - The module links table entries (MEM_MacAdd) on scan sightings.
+// - It fast-relinks the Auto_link_Add ("last connected") device,
+//   e.g. on its own boot, without pairing mode.
+// - It holds the link independently of the ESP32.
+// Consequences honored here: the table is never wiped (persist!),
+// Auto_link state is never disturbed (no blind rescans on drops),
+// and an ESP reboot syncs with the live state instead of tearing it
+// down. Tracks connection state so the UI can show it.
 class KcxController
 {
 public:
@@ -53,6 +56,9 @@ public:
   // Ask the module for its auto-link table (answers parsed into
   // linkedMacs()).
   void queryLinks();
+  // Reboot the module (answers OK+RESET, POWER ON). On its boot it
+  // fast-relinks remembered devices without pairing mode.
+  void resetModule();
   // Disconnect + rescan for devices.
   void startScan();
   void disconnect();
@@ -81,6 +87,12 @@ public:
   // Auto-link table as plain hex MACs without colons.
   const std::vector<String> &linkedMacs() const { return linkedMacs_; }
   bool isLinked(const String &macNoColons) const;
+  // True when the table holds anything but the sentinel: remembered
+  // devices worth trying to relink (e.g. via resetModule()).
+  bool hasRealEntries() const;
+  // Drop all scan sightings (fresh list); the module keeps scanning
+  // and its auto-link state on its own.
+  void clearSeen();
   String statusText() const;
 
 private:

@@ -157,10 +157,12 @@ void setupBluetooth()
     else
     {
       // Link lost: drop the scan list with it (entries would be ghosts
-      // otherwise) and rescan so the screen rebuilds from sightings.
-      Serial.println("[BT] Status: Disconnected / Scanning.");
+      // otherwise). Deliberately NO rescan here: the module keeps
+      // scanning and its auto-link state on its own, and a blind PAIR
+      // could disturb a fast relink in progress.
+      Serial.println("[BT] Status: Disconnected.");
       selectedMac = "";
-      bt.startScan();
+      bt.clearSeen();
     }
   });
 
@@ -188,12 +190,24 @@ void setupBluetooth()
     Serial.printf("[BT] Table holds %u device(s).\n", (unsigned)bt.linkedMacs().size());
   }
   // Sync with a link the module may still hold (an ESP reboot does not
-  // drop it): two paced polls let the debounce heal the flag. Rescan
-  // only when actually down, never blindly.
+  // drop it): two paced polls let the debounce heal the flag.
   bt.sendCommand("AT+STATUS?");
   bt.pump(400);
   bt.sendCommand("AT+STATUS?");
   bt.pump(400);
+  if (!bt.connected() && bt.hasRealEntries())
+  {
+    // Down but remembered devices exist: reboot the module so IT
+    // fast-relinks them without pairing mode, then re-sync.
+    Serial.println("[BT] Rebooting module to trigger relink...");
+    bt.resetModule();
+    bt.sendCommand("AT+STATUS?");
+    bt.pump(400);
+    bt.sendCommand("AT+STATUS?");
+    bt.pump(400);
+  }
+  // Rescan only when actually down, never blindly: the module keeps
+  // scanning and its auto-link state on its own.
   if (!bt.connected())
   {
     Serial.println("[BT] Starting scan...");
