@@ -88,6 +88,8 @@ void Screen::show(const String &trackName, int volume, const String &btStatus)
   lastTrack_ = trackName;
   lastVolume_ = volume;
   lastBt_ = btStatus;
+  // Invalidate the list-view cache so switching views repaints.
+  lastListSig_ = "\x01";
   repaint(trackName, volume, btStatus);
 }
 
@@ -102,4 +104,74 @@ void Screen::repaint(const String &trackName, int volume, const String &btStatus
   lcd.printf("Volume: %d\n", volume);
   lcd.setCursor(0, 70);
   lcd.println(btStatus);
+}
+
+void Screen::showDevices(const std::vector<BtDevice> &devices, int selected, const String &footer)
+{
+  // Signature covers everything visible; unchanged screen = zero traffic.
+  String sig = String(selected) + "|" + footer + "|";
+  for (const auto &d : devices)
+    sig += d.name + "," + d.mac + ";";
+  if (sig == lastListSig_)
+    return;
+  lastListSig_ = sig;
+  // Invalidate the now-playing cache so switching views repaints.
+  lastTrack_ = "\x01";
+  repaintDevices(devices, selected, footer);
+}
+
+void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected, const String &footer)
+{
+  constexpr int kTop = 20;
+  constexpr int kRowH = 18;
+  lcd.fillRect(0, 0, lcd.width(), 240, TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println("Bluetooth:");
+
+  if (devices.empty())
+  {
+    lcd.setCursor(0, kTop);
+    lcd.println("No devices found");
+  }
+  else
+  {
+    // Keep the selection visible in a window of kMaxRows.
+    int count = (int)devices.size();
+    int offset = 0;
+    if (selected >= kMaxRows)
+      offset = selected - kMaxRows + 1;
+    if (offset > count - kMaxRows)
+      offset = count - kMaxRows;
+    if (offset < 0)
+      offset = 0;
+    int rows = count - offset;
+    if (rows > kMaxRows)
+      rows = kMaxRows;
+    for (int i = 0; i < rows; ++i)
+    {
+      const BtDevice &d = devices[(size_t)(offset + i)];
+      int y = kTop + i * kRowH;
+      String label = d.name.isEmpty() ? d.mac : d.name;
+      if (label.length() > 22)
+        label = label.substring(0, 22);
+      if (offset + i == selected)
+      {
+        lcd.fillRect(0, (uint16_t)y, lcd.width(), (uint16_t)kRowH, TFT_YELLOW);
+        lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
+        lcd.setCursor(4, y + 1);
+        lcd.println(label);
+        lcd.setTextColor(TFT_YELLOW);
+      }
+      else
+      {
+        lcd.setCursor(4, y + 1);
+        lcd.println(label);
+      }
+    }
+  }
+
+  lcd.setCursor(0, 200);
+  lcd.println(footer);
+  lcd.setCursor(0, 220);
+  lcd.println("Up/Dn:move Cen:ok");
 }

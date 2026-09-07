@@ -51,7 +51,8 @@ void KcxController::startScan(bool clearMemory)
     sendCommand("AT+DELADD=ALL");
     delay(50);
   }
-  seenMacs_.clear();
+  seen_.clear();
+  connectPending_ = false;
   sendCommand("AT+DISCON");
 }
 
@@ -64,6 +65,7 @@ void KcxController::connectByMac(const String &rawMac)
 {
   String cleanMac = rawMac;
   cleanMac.replace(":", "");
+  connectPending_ = true;
   sendCommand("AT+CONADD=" + cleanMac);
 }
 
@@ -86,8 +88,10 @@ String KcxController::statusText() const
 {
   if (connected_)
     return "BT: " + peerName_;
-  if (!seenMacs_.empty())
-    return "BT: scanning (" + String(seenMacs_.size()) + " found)";
+  if (connectPending_)
+    return "BT: connecting...";
+  if (!seen_.empty())
+    return "BT: scan (" + String(seen_.size()) + " found)";
   return "BT: scanning...";
 }
 
@@ -106,12 +110,11 @@ void KcxController::parseLine(const String &line)
     name.trim();
     lastFoundName_ = name;
 
-    for (const auto &seen : seenMacs_)
+    for (const auto &seen : seen_)
     {
-      if (seen == mac)
+      if (seen.mac == mac)
         return;
     }
-    seenMacs_.push_back(mac);
 
     String formattedMac;
     for (size_t i = 0; i < mac.length(); ++i)
@@ -120,6 +123,7 @@ void KcxController::parseLine(const String &line)
       if ((i % 2 == 1) && (i + 1 < mac.length()))
         formattedMac += ':';
     }
+    seen_.push_back({name, formattedMac});
 
     if (onDeviceFound_)
       onDeviceFound_({name, formattedMac});
@@ -131,6 +135,7 @@ void KcxController::parseLine(const String &line)
       line.startsWith("CONNECT=>"))
   {
     connected_ = true;
+    connectPending_ = false;
     if (!lastFoundName_.isEmpty())
       peerName_ = lastFoundName_;
     if (onStatusChange_)
@@ -141,6 +146,7 @@ void KcxController::parseLine(const String &line)
   if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
   {
     connected_ = false;
+    connectPending_ = false;
     if (onStatusChange_)
       onStatusChange_(false, line);
     return;

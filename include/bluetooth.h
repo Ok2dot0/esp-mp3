@@ -35,8 +35,10 @@ public:
 
   // UI-facing state.
   bool connected() const { return connected_; }
+  bool connectPending() const { return connectPending_; }
   const String &peerName() const { return peerName_; }
-  size_t seenDeviceCount() const { return seenMacs_.size(); }
+  const std::vector<BtDevice> &seenDevices() const { return seen_; }
+  size_t seenDeviceCount() const { return seen_.size(); }
   String statusText() const;
 
 private:
@@ -44,11 +46,12 @@ private:
   uint8_t txPin_;
   HardwareSerial serial_;
   String rxBuffer_;
-  std::vector<String> seenMacs_;
+  std::vector<BtDevice> seen_;
   DeviceCallback onDeviceFound_ = nullptr;
   StatusCallback onStatusChange_ = nullptr;
 
   bool connected_ = false;
+  bool connectPending_ = false;
   String peerName_;
   String lastFoundName_;
 
