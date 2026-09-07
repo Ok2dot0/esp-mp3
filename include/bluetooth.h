@@ -97,6 +97,10 @@ private:
   bool connectPending_ = false;
   bool ready_ = false;
   bool versionSeen_ = false;
+  // Consecutive disagreeing STATUS polls. A single poll can sample the
+  // link mid-transition (stale), so only repeated agreement flips the
+  // state. Real CONNECT/DISCONNECT lines always act immediately.
+  uint8_t statusMismatch_ = 0;
   String peerName_;
   String lastFoundName_;
   unsigned long lastStatusPoll_ = 0;

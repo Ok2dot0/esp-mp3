@@ -273,11 +273,21 @@ void KcxController::parseLine(const String &line)
     return;
   }
 
-  // Link poll answers, e.g. "OK+STATUS:1".
+  // Link poll answers, e.g. "OK+STATUS:1". Debounced: one poll can
+  // catch the link mid-transition, so two in a row must agree before
+  // the state flips. CONNECT/DISCONNECT lines bypass this entirely.
   if (line.startsWith("OK+STATUS:"))
   {
     bool up = line.endsWith("1");
-    setConnected(up, line);
+    if (up == connected_)
+    {
+      statusMismatch_ = 0;
+    }
+    else if (++statusMismatch_ >= 2)
+    {
+      statusMismatch_ = 0;
+      setConnected(up, line);
+    }
     return;
   }
 
@@ -290,6 +300,7 @@ void KcxController::parseLine(const String &line)
       line.startsWith("CON:") ||
       line.indexOf("CONNECTED") >= 0)
   {
+    statusMismatch_ = 0;
     if (!lastFoundName_.isEmpty())
       peerName_ = lastFoundName_;
     setConnected(true, line);
@@ -298,6 +309,7 @@ void KcxController::parseLine(const String &line)
 
   if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
   {
+    statusMismatch_ = 0;
     setConnected(false, line);
     return;
   }

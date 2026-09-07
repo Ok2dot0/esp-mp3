@@ -267,9 +267,10 @@ void loopBtMenu()
   }
 
   const auto &devs = bt.seenDevices();
-  // Forget devices gone quiet: the module re-reports visible ones, so
-  // only switched-off/out-of-range entries vanish (no ghosts).
-  size_t dropped = bt.pruneDevices(15000);
+  // Forget devices gone quiet: the module re-reports visible ones about
+  // every ~15-20 s, so only switched-off/out-of-range entries vanish
+  // (no ghosts). Margin kept wide so the selection never flickers.
+  size_t dropped = bt.pruneDevices(30000);
   if (dropped > 0)
     Serial.printf("[BT] Forgot %u stale device(s).\n", (unsigned)dropped);
   int sel = selectedDeviceIndex();
