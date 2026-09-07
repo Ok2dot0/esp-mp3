@@ -26,17 +26,37 @@ ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
 Screen screen;
 AudioPlayer player;
 
-// Click-wheel button bits (see ClickWheel::update).
-constexpr uint8_t kBtnCenter = 0x01;
-constexpr uint8_t kBtnDown = 0x08;
-constexpr uint8_t kBtnUp = 0x10;
-
-// Pairing UI state: raw wheel motion and buttons, consumed by loopBtMenu().
+// Pairing UI state: raw wheel motion, consumed by loopBtMenu().
 // When connected the wheel drives volume instead (see loop routing below).
 int wheelMotion = 0;
-uint8_t wheelButtons = 0;
 String selectedMac;
 int listScrollRemainder = 0;
+
+// Debounced BOOT button (active LOW). Returns true once per press.
+bool bootButtonPressed()
+{
+  constexpr unsigned long kDebounceMs = 40;
+  static bool lastLevel = HIGH;
+  static unsigned long lastChangeAt = 0;
+  static bool fired = false;
+  bool level = digitalRead(Pins::BTN_BOOT);
+  if (level != lastLevel)
+  {
+    lastLevel = level;
+    lastChangeAt = millis();
+  }
+  if (level == HIGH)
+  {
+    fired = false;
+    return false;
+  }
+  if (!fired && millis() - lastChangeAt > kDebounceMs)
+  {
+    fired = true;
+    return true;
+  }
+  return false;
+}
 
 void IRAM_ATTR clickWheelISR()
 {
@@ -107,24 +127,22 @@ void setupClickWheel()
     }
     prevPos = state.position;
     prevTouch = state.touching;
-    wheelButtons = state.buttons;
-    Serial.printf("[Wheel] %s pos=%3u | Buttons [C:%d U:%d D:%d R:%d L:%d]\n",
+    Serial.printf("[Wheel] %s pos=%3u\n",
                   state.touching ? "TOUCH" : "FREE ",
-                  state.position,
-                  state.btnCenter,
-                  state.btnUp,
-                  state.btnDown,
-                  state.btnRight,
-                  state.btnLeft);
+                  state.position);
   });
 
   wheel.begin(clickWheelISR);
   Serial.println("[Wheel] Click wheel listener started.");
 }
 
-void setupBluetooth()
+void setupButtons()
 {
-  bt.onDeviceFound([](const BtDevice &dev)
+  pinMode(Pins::BTN_BOOT, INPUT_PULLUP);
+}
+
+void setupBluetooth()
+{  bt.onDeviceFound([](const BtDevice &dev)
   {
     // Listed on screen; the user picks what to connect (see loopBtMenu).
     Serial.printf("[BT] Found: %-25s | MAC: %s\n", dev.name.c_str(), dev.mac.c_str());
@@ -202,19 +220,16 @@ void setSelectedDevice(int index)
   }
 }
 
-// Pairing UI: scroll the scan list with the wheel or Up/Down, Center to
-// connect. While connected the wheel goes to volume and Center
-// disconnects back to the list.
+// Pairing UI: scroll the scan list with the wheel, BOOT to connect.
+// While connected the wheel goes to volume and BOOT disconnects back
+// to the list.
 void loopBtMenu()
 {
   if (bt.connected())
   {
     player.addWheelMotion(wheelMotion);
     wheelMotion = 0;
-    static uint8_t prevButtonsConnected = 0;
-    uint8_t pressed = wheelButtons & ~prevButtonsConnected;
-    prevButtonsConnected = wheelButtons;
-    if (pressed & kBtnCenter)
+    if (bootButtonPressed())
     {
       Serial.println("[BT] Disconnect requested.");
       bt.disconnect();
@@ -240,16 +255,7 @@ void loopBtMenu()
     sel = selectedDeviceIndex();
   }
 
-  // Button scroll + confirm (rising edges only).
-  static uint8_t prevButtons = 0;
-  uint8_t pressed = wheelButtons & ~prevButtons;
-  prevButtons = wheelButtons;
-  if (pressed & kBtnUp)
-    setSelectedDevice(sel - 1);
-  if (pressed & kBtnDown)
-    setSelectedDevice(sel + 1);
-  sel = selectedDeviceIndex();
-  if ((pressed & kBtnCenter) && sel >= 0)
+  if (bootButtonPressed() && sel >= 0)
   {
     Serial.printf("[BT] Connecting to %s (%s)...\n",
                   devs[(size_t)sel].name.c_str(), devs[(size_t)sel].mac.c_str());
@@ -279,6 +285,7 @@ void setup()
   player.begin(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
   setupFileSystem();
   setupClickWheel();
+  setupButtons();
   setupBluetooth();
 }
 

@@ -35,12 +35,6 @@ void ClickWheel::update(bool printRaw)
   }
 
   State state;
-  state.buttons = frame[1];
-  state.btnCenter = (frame[1] & 0x01) != 0;
-  state.btnRight = (frame[1] & 0x02) != 0;
-  state.btnLeft = (frame[1] & 0x04) != 0;
-  state.btnDown = (frame[1] & 0x08) != 0;
-  state.btnUp = (frame[1] & 0x10) != 0;
   state.delta = frame[2] - lastPosition_;
   lastPosition_ = frame[2];
   state.position = frame[2];

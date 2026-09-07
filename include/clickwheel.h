@@ -14,12 +14,6 @@ public:
     bool touching;
     uint8_t position;
     uint8_t delta;
-    uint8_t buttons;
-    bool btnCenter;
-    bool btnRight;
-    bool btnLeft;
-    bool btnDown;
-    bool btnUp;
     uint8_t statusByte;
   };
 

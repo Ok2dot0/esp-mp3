@@ -173,5 +173,5 @@ void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected, 
   lcd.setCursor(0, 200);
   lcd.println(footer);
   lcd.setCursor(0, 220);
-  lcd.println("Up/Dn:move Cen:ok");
+  lcd.println("Wheel:move Boot:ok");
 }

@@ -20,11 +20,15 @@ namespace Pins
   constexpr uint8_t DAC_WS = 7;
   constexpr uint8_t DAC_DIN = 16;
 
-  // iPod click wheel.
+  // iPod click wheel (rotation only - the module has no buttons).
   constexpr uint8_t CLICK_CLK = 4;
   constexpr uint8_t CLICK_DATA = 5;
   constexpr uint8_t CLICK_WAKE = 18;
   constexpr uint8_t CLICK_RESET = 21;
+
+  // Board BOOT button, active LOW. Used to confirm pairing etc.
+  // (Also a strapping pin: keep HIGH at reset for normal boot.)
+  constexpr uint8_t BTN_BOOT = 0;
 
   // LCD on SPI2 (owned by LovyanGFX).
   constexpr uint8_t LCD_SCLK = 8;
