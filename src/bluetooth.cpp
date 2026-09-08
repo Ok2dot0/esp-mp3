@@ -219,6 +219,61 @@ String KcxController::statusText() const
   return "BT: scanning...";
 }
 
+namespace
+{
+
+// Splits "MacAdd:<hex>[,]Name:<name>" (scan reports and CONNECT=>
+// announcements share the shape). MAC comes back plain/lowercase.
+bool splitMacName(const String &line, String &macNoColons, String &name)
+{
+  int macIdx = line.indexOf("MacAdd:");
+  int nameIdx = line.indexOf("Name:");
+  if (macIdx < 0 || nameIdx < 0 || nameIdx < macIdx)
+    return false;
+  macNoColons = line.substring(macIdx + 7, nameIdx);
+  macNoColons.replace(",", "");
+  macNoColons.trim();
+  macNoColons.toLowerCase();
+  name = line.substring(nameIdx + 5);
+  name.trim();
+  return macNoColons.length() > 0;
+}
+
+String formatMac(const String &macNoColons)
+{
+  String formatted;
+  for (size_t i = 0; i < macNoColons.length(); ++i)
+  {
+    formatted += macNoColons[i];
+    if ((i % 2 == 1) && (i + 1 < macNoColons.length()))
+      formatted += ':';
+  }
+  return formatted;
+}
+
+} // namespace
+
+void KcxController::rememberSighting(const String &name, const String &formattedMac)
+{
+  lastFoundName_ = name;
+  // Re-sightings refresh the timestamp so present devices survive
+  // pruning while gone ones expire.
+  for (auto &seen : seen_)
+  {
+    if (seen.mac == formattedMac)
+    {
+      seen.lastSeen = millis();
+      if (seen.name != name)
+        seen.name = name;
+      return;
+    }
+  }
+  seen_.push_back({name, formattedMac, millis()});
+
+  if (onDeviceFound_)
+    onDeviceFound_({name, formattedMac});
+}
+
 void KcxController::parseLine(const String &line)
 {
   Serial.printf("[KCX] << %s\n", line.c_str());
@@ -227,44 +282,38 @@ void KcxController::parseLine(const String &line)
     ready_ = true;
     return;
   }
-  if (line.indexOf("MacAdd:") >= 0 && line.indexOf("Name:") >= 0)
+  // Connect indications per the KCX protocol (see KCX_BT_Emitter lib):
+  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD", "CON:0x...",
+  // "CONNECT=>MacAdd:..,Name:..". Checked before plain sightings so a
+  // CONNECT=> announcement both links and identifies the peer.
+  if (line.startsWith("CONNECT") ||
+      line.startsWith("CON ONE") ||
+      line.startsWith("CON LAST") ||
+      line.startsWith("CON MATCH") ||
+      line.startsWith("CON:") ||
+      line.indexOf("CONNECTED") >= 0)
   {
-    int macIdx = line.indexOf("MacAdd:");
-    int nameIdx = line.indexOf("Name:");
-
-    String mac = line.substring(macIdx + 7, nameIdx);
-    mac.replace(",", "");
-    mac.trim();
-
-    String name = line.substring(nameIdx + 5);
-    name.trim();
-    lastFoundName_ = name;
-
-    String formattedMac;
-    for (size_t i = 0; i < mac.length(); ++i)
+    statusMismatch_ = 0;
+    lastLinkUpMs_ = millis();
+    String mac, name;
+    if (splitMacName(line, mac, name))
     {
-      formattedMac += mac[i];
-      if ((i % 2 == 1) && (i + 1 < mac.length()))
-        formattedMac += ':';
+      peerName_ = name;
+      rememberSighting(name, formatMac(mac));
     }
-
-    // Compare formatted MACs: the stored entries keep colons.
-    // Re-sightings refresh the timestamp so present devices survive
-    // pruning while gone ones expire.
-    for (auto &seen : seen_)
+    else if (!lastFoundName_.isEmpty())
     {
-      if (seen.mac == formattedMac)
-      {
-        seen.lastSeen = millis();
-        if (seen.name != name)
-          seen.name = name;
-        return;
-      }
+      peerName_ = lastFoundName_;
     }
-    seen_.push_back({name, formattedMac, millis()});
+    setConnected(true, line);
+    return;
+  }
 
-    if (onDeviceFound_)
-      onDeviceFound_({name, formattedMac});
+  // Plain scan sightings, e.g. "MacAdd:ab..,Name:Jabra Evolve 65".
+  String mac, name;
+  if (splitMacName(line, mac, name))
+  {
+    rememberSighting(name, formatMac(mac));
     return;
   }
 
@@ -322,23 +371,6 @@ void KcxController::parseLine(const String &line)
       statusMismatch_ = 0;
       setConnected(up, line);
     }
-    return;
-  }
-
-  // Connect indications per the KCX protocol (see KCX_BT_Emitter lib):
-  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD", "CON:0x...".
-  if (line.startsWith("CONNECT") ||
-      line.startsWith("CON ONE") ||
-      line.startsWith("CON LAST") ||
-      line.startsWith("CON MATCH") ||
-      line.startsWith("CON:") ||
-      line.indexOf("CONNECTED") >= 0)
-  {
-    statusMismatch_ = 0;
-    lastLinkUpMs_ = millis();
-    if (!lastFoundName_.isEmpty())
-      peerName_ = lastFoundName_;
-    setConnected(true, line);
     return;
   }
 

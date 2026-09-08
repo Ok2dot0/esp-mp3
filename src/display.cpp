@@ -67,6 +67,20 @@ public:
 
 LGFX lcd;
 
+// True when the colon-formatted MAC is in the no-colon known list.
+bool isKnownMac(const String &formattedMac, const std::vector<String> &knownMacs)
+{
+  String plain = formattedMac;
+  plain.replace(":", "");
+  plain.toLowerCase();
+  for (const auto &known : knownMacs)
+  {
+    if (plain == known)
+      return true;
+  }
+  return false;
+}
+
 } // namespace
 
 void Screen::begin()
@@ -123,23 +137,23 @@ void Screen::repaint(const String &trackName, int volume, const String &btStatus
   lcd.println(btStatus);
 }
 
-void Screen::showDevices(const std::vector<BtDevice> &devices, int selected, const String &footer)
+void Screen::showDevices(const std::vector<BtDevice> &devices, int selected,
+                      const String &footer, const std::vector<String> &knownMacs)
 {
   // Signature covers everything visible; unchanged screen = zero traffic.
   String sig = String(selected) + "|" + footer + "|";
   for (const auto &d : devices)
-    sig += d.name + "," + d.mac + ";";
+    sig += String(isKnownMac(d.mac, knownMacs) ? '*' : ' ') + d.name + "," + d.mac + ";";
   if (sig == lastListSig_)
     return;
-  Serial.printf("[DSP] list repaint: sig='%s' heap=%u\n", sig.c_str(), (unsigned)ESP.getFreeHeap());
   lastListSig_ = sig;
   // Invalidate the now-playing cache so switching views repaints.
   lastTrack_ = "\x01";
-  repaintDevices(devices, selected, footer);
-  Serial.println("[DSP] list repaint done");
+  repaintDevices(devices, selected, footer, knownMacs);
 }
 
-void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected, const String &footer)
+void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected,
+                            const String &footer, const std::vector<String> &knownMacs)
 {
   constexpr int kTop = 20;
   constexpr int kRowH = 18;
@@ -171,6 +185,8 @@ void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected, 
       const BtDevice &d = devices[(size_t)(offset + i)];
       int y = kTop + i * kRowH;
       String label = d.name.isEmpty() ? d.mac : d.name;
+      if (isKnownMac(d.mac, knownMacs))
+        label = "* " + label;
       if (label.length() > 22)
         label = label.substring(0, 22);
       if (offset + i == selected)

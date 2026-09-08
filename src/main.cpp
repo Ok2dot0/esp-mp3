@@ -333,11 +333,13 @@ void loopBtMenu()
     }
     else
     {
-      Serial.println("[BTN] BOOT pressed, but the device list is empty.");
+      // Nothing to pick: kick a fresh scan instead of idling.
+      Serial.println("[BTN] BOOT pressed on empty list, rescanning.");
+      bt.startScan();
     }
   }
 
-  screen.showDevices(devs, sel, bt.statusText());
+  screen.showDevices(devs, sel, bt.statusText(), bt.linkedMacs());
 }
 
 void loopSerialCommands()

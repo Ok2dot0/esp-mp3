@@ -127,4 +127,7 @@ private:
 
   void parseLine(const String &line);
   void setConnected(bool connected, const String &detail);
+  // Records a scan sighting (new or refresh); fires onDeviceFound once
+  // per previously unseen MAC.
+  void rememberSighting(const String &name, const String &formattedMac);
 };

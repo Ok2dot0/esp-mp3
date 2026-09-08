@@ -20,8 +20,11 @@ public:
   void message(const String &line1, const String &line2 = "");
 
   // Bluetooth pairing view: discovered devices with a highlighted
-  // selection, plus a status footer. Same change-only repaint policy.
-  void showDevices(const std::vector<BtDevice> &devices, int selected, const String &footer);
+  // selection, plus a status footer. knownMacs holds remembered (auto-
+  // link table) MACs without colons; those rows get a "*" marker.
+  // Same change-only repaint policy.
+  void showDevices(const std::vector<BtDevice> &devices, int selected,
+                   const String &footer, const std::vector<String> &knownMacs);
 
 private:
   static constexpr int kMaxRows = 6;
@@ -32,5 +35,6 @@ private:
   String lastListSig_;
 
   void repaint(const String &trackName, int volume, const String &btStatus);
-  void repaintDevices(const std::vector<BtDevice> &devices, int selected, const String &footer);
+  void repaintDevices(const std::vector<BtDevice> &devices, int selected,
+                      const String &footer, const std::vector<String> &knownMacs);
 };
