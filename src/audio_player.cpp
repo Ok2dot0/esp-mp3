@@ -26,8 +26,20 @@ void AudioPlayer::playFile(const char *path, const char *label)
 {
   currentPath_ = path;
   currentLabel_ = label;
+  metaTitle_ = "";
+  metaArtist_ = "";
+  metaAlbum_ = "";
   bool ok = audio.connecttoFS(SD, path);
   Serial.printf("[Audio] Playing: %s (connect %s)\n", label, ok ? "OK" : "FAILED");
+}
+
+bool AudioPlayer::takeRepeat()
+{
+  noInterrupts();
+  bool r = repeat_;
+  repeat_ = false;
+  interrupts();
+  return r;
 }
 
 void AudioPlayer::addWheelMotion(int delta)
@@ -39,16 +51,6 @@ void AudioPlayer::update()
 {
   audio.loop();
   audio.setVolume(volume_);
-
-  if (repeat_)
-  {
-    repeat_ = false;
-    if (!currentPath_.isEmpty())
-    {
-      Serial.println("[Audio] Restarting track: " + currentLabel_);
-      audio.connecttoFS(SD, currentPath_.c_str());
-    }
-  }
 
   // Fractional accumulation: 1 volume step per 4 wheel units. The leftover
   // remainder is kept, so slow turns still register smoothly and fast
@@ -92,4 +94,31 @@ void AudioPlayer::handleInfo(Audio::msg_t m)
     Serial.println("[Audio] EOF event detected!");
     repeat_ = true;
   }
+
+  if (m.e == Audio::evt_id3data && m.msg)
+    handleMetadata(String(m.msg));
+}
+
+// Metadata arrives as plain "KEY=value" (Vorbis comments in FLAC) or
+// "Key: value" (ID3). Keep title/artist/album for the display.
+void AudioPlayer::handleMetadata(const String &tag)
+{
+  int sep = tag.indexOf('=');
+  if (sep < 0)
+    sep = tag.indexOf(':');
+  if (sep <= 0)
+    return;
+  String key = tag.substring(0, sep);
+  key.trim();
+  key.toUpperCase();
+  String value = tag.substring(sep + 1);
+  value.trim();
+  if (value.isEmpty())
+    return;
+  if (key == "TITLE")
+    metaTitle_ = value;
+  else if (key == "ARTIST")
+    metaArtist_ = value;
+  else if (key == "ALBUM")
+    metaAlbum_ = value;
 }

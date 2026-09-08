@@ -94,19 +94,92 @@ void Screen::begin()
   lcd.setCursor(20, 20);
   lcd.println("ILI9341 Display Ready!");
 }
-
-void Screen::show(const String &trackName, int volume, const String &btStatus)
-{  if (trackName == lastTrack_ && volume == lastVolume_ && btStatus == lastBt_)
-    return; // Nothing changed: leave the pixels alone (no blink).
-  Serial.printf("[DSP] now-playing repaint: track='%s' vol=%d bt='%s' heap=%u\n",
-                trackName.c_str(), volume, btStatus.c_str(), (unsigned)ESP.getFreeHeap());
-  lastTrack_ = trackName;
+void Screen::showPlayer(const String &title, const String &artist, int volume,
+                        const String &btStatus)
+{
+  String sig = title + "|" + artist + "|" + String(volume) + "|" + btStatus;
+  if (sig == lastTrack_)
+    return;
+  Serial.printf("[DSP] player repaint: '%s' heap=%u\n", title.c_str(), (unsigned)ESP.getFreeHeap());
+  lastTrack_ = sig;
   lastVolume_ = volume;
   lastBt_ = btStatus;
-  // Invalidate the list-view cache so switching views repaints.
   lastListSig_ = "\x01";
-  repaint(trackName, volume, btStatus);
-  Serial.println("[DSP] now-playing repaint done");
+  lastTracksSig_ = "\x01";
+  repaintPlayer(title, artist, volume, btStatus);
+  Serial.println("[DSP] player repaint done");
+}
+
+void Screen::showTracks(const std::vector<String> &labels, int highlight,
+                        const String &header)
+{
+  String sig = String(highlight) + "|" + header + "|";
+  for (const auto &l : labels)
+    sig += l + ";";
+  if (sig == lastTracksSig_)
+    return;
+  lastTracksSig_ = sig;
+  lastTrack_ = "\x01";
+  lastListSig_ = "\x01";
+  repaintTracks(labels, highlight, header);
+}
+
+void Screen::repaintPlayer(const String &title, const String &artist, int volume,
+                           const String &btStatus)
+{
+  lcd.fillRect(0, 0, lcd.width(), 120, TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println(title.isEmpty() ? String("...") : title);
+  lcd.setCursor(0, 20);
+  lcd.println(artist);
+  lcd.setCursor(0, 50);
+  lcd.printf("Volume: %d\n", volume);
+  lcd.setCursor(0, 70);
+  lcd.println(btStatus);
+}
+
+void Screen::repaintTracks(const std::vector<String> &labels, int highlight,
+                           const String &header)
+{
+  constexpr int kTop = 20;
+  constexpr int kRowH = 18;
+  constexpr int kMaxRows = 6;
+  lcd.fillRect(0, 0, lcd.width(), 240, TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println(header);
+  int count = (int)labels.size();
+  int offset = 0;
+  if (highlight >= kMaxRows)
+    offset = highlight - kMaxRows + 1;
+  if (offset > count - kMaxRows)
+    offset = count - kMaxRows;
+  if (offset < 0)
+    offset = 0;
+  int rows = count - offset;
+  if (rows > kMaxRows)
+    rows = kMaxRows;
+  for (int i = 0; i < rows; ++i)
+  {
+    String label = labels[(size_t)(offset + i)];
+    if (label.length() > 24)
+      label = label.substring(0, 24);
+    int y = kTop + i * kRowH;
+    if (offset + i == highlight)
+    {
+      lcd.fillRect(0, (uint16_t)y, lcd.width(), (uint16_t)kRowH, TFT_YELLOW);
+      lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
+      lcd.setCursor(4, y + 1);
+      lcd.println(label);
+      lcd.setTextColor(TFT_YELLOW);
+    }
+    else
+    {
+      lcd.setCursor(4, y + 1);
+      lcd.println(label);
+    }
+  }
+  lcd.setCursor(0, 220);
+  lcd.println("Boot:play");
 }
 
 void Screen::message(const String &line1, const String &line2)
@@ -122,19 +195,6 @@ void Screen::message(const String &line1, const String &line2)
     lcd.setCursor(0, 20);
     lcd.println(line2);
   }
-}
-
-void Screen::repaint(const String &trackName, int volume, const String &btStatus)
-{
-  lcd.fillRect(0, 0, lcd.width(), 120, TFT_BLACK);
-  lcd.setCursor(0, 0);
-  lcd.println("Current Track:");
-  lcd.setCursor(0, 20);
-  lcd.println(trackName);
-  lcd.setCursor(0, 50);
-  lcd.printf("Volume: %d\n", volume);
-  lcd.setCursor(0, 70);
-  lcd.println(btStatus);
 }
 
 void Screen::showDevices(const std::vector<BtDevice> &devices, int selected,
@@ -208,5 +268,5 @@ void Screen::repaintDevices(const std::vector<BtDevice> &devices, int selected,
   lcd.setCursor(0, 200);
   lcd.println(footer);
   lcd.setCursor(0, 220);
-  lcd.println("Wheel:move Boot:ok");
+  lcd.println("Boot:connect");
 }

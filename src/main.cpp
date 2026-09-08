@@ -4,16 +4,16 @@
 //   pins         - central pin map
 //   filesystem   - SD card + audio file discovery
 //   bluetooth    - KCX BT emitter driver + connection state
-//   clickwheel   - iPod click wheel decoder
-//   display      - LCD now-playing screen (track, volume, bluetooth)
-//   audio_player - I2S playback, volume, auto-repeat
+//   display      - LCD screens (player, browser, bluetooth)
+//   audio_player - I2S playback, volume, metadata
 //
+// Input is the BOOT button only (short/long press); the click wheel
+// lives on the hw/clickwheel branch until the touchscreen arrives.
 // main.cpp only owns the module instances and wires them together.
 
 #include "Arduino.h"
 #include "audio_player.h"
 #include "bluetooth.h"
-#include "clickwheel.h"
 #include "display.h"
 #include "filesystem.h"
 #include "pins.h"
@@ -22,19 +22,28 @@ namespace
 {
 
 KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
-ClickWheel wheel(Pins::CLICK_CLK, Pins::CLICK_DATA);
 Screen screen;
 AudioPlayer player;
 
-// Pairing UI state: raw wheel motion, consumed by loopBtMenu().
-// When connected (or BT is off) the wheel drives volume instead.
-int wheelMotion = 0;
-String selectedMac;
-int listScrollRemainder = 0;
+// UI views, cycled with a long BOOT press.
+enum class View
+{
+  Player,
+  Tracks,
+  Bt,
+  Off
+};
+View view = View::Player;
 
-// Bluetooth master switch. Off = idle: link dropped, list UI hidden,
-// module left alone. Toggled with a long BOOT press.
-bool btEnabled = true;
+// Playlist state: index of the playing track, cursor of the browser.
+size_t currentTrack = 0;
+size_t trackCursor = 0;
+
+// Pairing UI state.
+String selectedMac;
+
+void playFileAt(size_t index);
+void playNext();
 
 enum class BootPress
 {
@@ -78,17 +87,9 @@ BootPress pollBootButton()
   return BootPress::None;
 }
 
-void IRAM_ATTR clickWheelISR()
+void setupButtons()
 {
-  wheel.handleEdge();
-}
-
-void resetClickWheel()
-{
-  digitalWrite(Pins::CLICK_RESET, LOW);
-  delay(20);
-  digitalWrite(Pins::CLICK_RESET, HIGH);
-  delay(50);
+  pinMode(Pins::BTN_BOOT, INPUT_PULLUP);
 }
 
 void setupSerial()
@@ -109,8 +110,7 @@ void setupFileSystem()
     Serial.printf("[FS] Found %u track(s).\n", (unsigned)FileSystem::tracks.size());
     if (!FileSystem::tracks.empty())
     {
-      player.playFile(FileSystem::tracks[0].path.c_str(),
-                      FileSystem::tracks[0].name.c_str());
+      playFileAt(0);
     }
     else
     {
@@ -121,44 +121,6 @@ void setupFileSystem()
   {
     Serial.println("[SD] Initialization failed!");
   }
-}
-
-void setupClickWheel()
-{
-  pinMode(Pins::CLICK_RESET, OUTPUT);
-  resetClickWheel();
-  pinMode(Pins::CLICK_WAKE, INPUT_PULLUP);
-
-  wheel.onReport([](const ClickWheel::State &state)
-  {
-    // Convert wheel motion into volume/scroll input. Only count motion
-    // while the finger stays down: a fresh touch has no reference
-    // position, so using it would turn every re-touch into a jump.
-    static uint8_t prevPos = 0;
-    static bool prevTouch = false;
-    if (state.touching && prevTouch)
-    {
-      // int8_t cast keeps the 0..255 wraparound direction-aware.
-      int d = (int8_t)(state.position - prevPos);
-      // Clamp spikes from noisy frames; the accumulator keeps the rest.
-      if (d > 10) d = 10;
-      if (d < -10) d = -10;
-      wheelMotion += d;
-    }
-    prevPos = state.position;
-    prevTouch = state.touching;
-    Serial.printf("[Wheel] %s pos=%3u\n",
-                  state.touching ? "TOUCH" : "FREE ",
-                  state.position);
-  });
-
-  wheel.begin(clickWheelISR);
-  Serial.println("[Wheel] Click wheel listener started.");
-}
-
-void setupButtons()
-{
-  pinMode(Pins::BTN_BOOT, INPUT_PULLUP);
 }
 
 void setupBluetooth()
@@ -240,32 +202,69 @@ void setupBluetooth()
   bt.setPolling(true);
 }
 
-void loopClickWheel()
+// Playlist: play index (wraps), advance on EOF via takeRepeat().
+void playFileAt(size_t index)
 {
-  wheel.update(true);
+  if (FileSystem::tracks.empty())
+    return;
+  currentTrack = index % FileSystem::tracks.size();
+  trackCursor = currentTrack;
+  const Track &t = FileSystem::tracks[currentTrack];
+  player.playFile(t.path.c_str(), t.name.c_str());
+}
 
-  static unsigned long lastWheelDiag = 0;
-  static uint32_t lastDiagEdgeCount = 0;
-  if (millis() - lastWheelDiag > 2000)
+void playNext()
+{
+  if (FileSystem::tracks.empty())
+    return;
+  playFileAt(currentTrack + 1);
+}
+
+void loopAudio()
+{
+  if (player.takeRepeat())
+    playNext();
+}
+
+const char *viewName(View v)
+{
+  switch (v)
   {
-    lastWheelDiag = millis();
-    uint32_t edgesNow = wheel.edgeCount();
-    Serial.printf("[Wheel] diag: %lu total edges (+%lu since last) | WAKE=%d\n",
-                  (unsigned long)edgesNow,
-                  (unsigned long)(edgesNow - lastDiagEdgeCount),
-                  digitalRead(Pins::CLICK_WAKE));
-    lastDiagEdgeCount = edgesNow;
+  case View::Player: return "Player";
+  case View::Tracks: return "Tracks";
+  case View::Bt: return "BT";
+  case View::Off: return "Off";
+  }
+  return "?";
+}
+
+void enterView(View v)
+{
+  view = v;
+  Serial.printf("[UI] View: %s\n", viewName(v));
+  if (v == View::Bt && !bt.connected())
+  {
+    Serial.println("[BT] Starting scan...");
+    bt.startScan();
+  }
+  if (v == View::Off && bt.connected())
+  {
+    Serial.println("[BT] Leaving BT, disconnecting.");
+    bt.disconnect();
   }
 }
 
 void loopDisplay()
 {
-  // The device list owns the screen while pairing with BT on.
-  if (btEnabled && !bt.connected())
-    return;
-  String track = FileSystem::tracks.empty() ? "No tracks found." : FileSystem::tracks[0].name;
-  String btline = bt.connected() ? bt.statusText() : String("BT: off");
-  screen.show(track, player.volume(), btline);
+  if (view == View::Bt && !bt.connected())
+    return; // Device list owns the screen (see loopBtMenu).
+  if (view == View::Tracks)
+    return; // Track browser owns the screen (see loopTracks).
+  String title = player.metaTitle();
+  if (title.isEmpty())
+    title = FileSystem::tracks.empty() ? "No tracks found." : FileSystem::tracks[currentTrack].name;
+  String btline = (!bt.connected() && view == View::Off) ? String("BT: off") : bt.statusText();
+  screen.showPlayer(title, player.metaArtist(), player.volume(), btline);
 }
 
 // Index of the selected device in the current scan results (-1 if none).
@@ -299,49 +298,11 @@ void setSelectedDevice(int index)
   }
 }
 
-// Bluetooth UI: scroll the scan list with the wheel, short BOOT to
-// connect/disconnect, long BOOT to switch pairing on/off (idle).
-// The wheel drives volume while connected or while BT is off.
-void loopBtMenu()
+// Bluetooth view: SHORT connects (or rescans when empty).
+void loopBtMenu(BootPress press)
 {
-  bool linked = bt.connected();
-  if (!btEnabled || linked)
-  {
-    player.addWheelMotion(wheelMotion);
-    wheelMotion = 0;
-  }
-
-  BootPress press = pollBootButton();
-  if (press == BootPress::Long)
-  {
-    btEnabled = !btEnabled;
-    if (!btEnabled)
-    {
-      Serial.println("[BTN] Long press: Bluetooth off (idle).");
-      bt.disconnect();
-    }
-    else
-    {
-      Serial.println("[BTN] Long press: Bluetooth on, scanning.");
-      bt.startScan();
-    }
-  }
-
-  if (linked)
-  {
-    if (press == BootPress::Short)
-    {
-      Serial.println("[BTN] BOOT pressed while connected.");
-      // Note: the module re-links remembered devices by itself, so it
-      // may come straight back if the peer is still around.
-      Serial.println("[BT] Disconnect requested.");
-      bt.disconnect();
-    }
-    return;
-  }
-
-  if (!btEnabled)
-    return; // Idle: screen stays on now-playing (see loopDisplay).
+  if (bt.connected())
+    return; // Link owns the view; now-playing shows the peer name.
 
   const auto &devs = bt.seenDevices();
   // Forget devices gone quiet: the module re-reports visible ones about
@@ -355,17 +316,6 @@ void loopBtMenu()
     sel = 0;
   setSelectedDevice(sel);
   sel = selectedDeviceIndex();
-
-  // Wheel scroll: one entry per 4 motion units, remainder kept.
-  listScrollRemainder += wheelMotion;
-  wheelMotion = 0;
-  int steps = listScrollRemainder / 4;
-  if (steps != 0)
-  {
-    listScrollRemainder -= steps * 4;
-    setSelectedDevice(sel + steps);
-    sel = selectedDeviceIndex();
-  }
 
   if (press == BootPress::Short)
   {
@@ -387,6 +337,73 @@ void loopBtMenu()
   screen.showDevices(devs, sel, bt.statusText(), bt.linkedMacs());
 }
 
+// Track browser view: SHORT plays the cursor and steps it forward,
+// so repeated presses walk through the library.
+void loopTracks(BootPress press)
+{
+  const auto &tracks = FileSystem::tracks;
+  if (!tracks.empty() && trackCursor >= tracks.size())
+    trackCursor = 0;
+  if (press == BootPress::Short && !tracks.empty())
+  {
+    Serial.printf("[BTN] Playing track %u.\n", (unsigned)trackCursor);
+    playFileAt(trackCursor);
+    trackCursor = (trackCursor + 1) % tracks.size();
+  }
+
+  std::vector<String> labels;
+  labels.reserve(tracks.size());
+  for (size_t i = 0; i < tracks.size(); ++i)
+    labels.push_back(String(i == currentTrack ? "> " : "  ") + tracks[i].name);
+  String header = "Tracks " + String((unsigned)(tracks.empty() ? 0 : trackCursor + 1)) +
+                  "/" + String((unsigned)tracks.size());
+  screen.showTracks(labels, (int)trackCursor, header);
+}
+
+// Routes one BOOT press by view. LONG always cycles views.
+void loopUi()
+{
+  BootPress press = pollBootButton();
+  if (press == BootPress::Long)
+  {
+    View next = View::Player;
+    if (view == View::Player)
+      next = View::Tracks;
+    else if (view == View::Tracks)
+      next = View::Bt;
+    else if (view == View::Bt)
+      next = View::Off;
+    enterView(next);
+    return;
+  }
+
+  if (view == View::Tracks)
+  {
+    loopTracks(press);
+    return;
+  }
+  if (view == View::Bt)
+  {
+    loopBtMenu(press);
+    return;
+  }
+  // Player + Off views: SHORT skips, or disconnects an active link.
+  if (press == BootPress::Short)
+  {
+    if (bt.connected())
+    {
+      // Note: the module re-links remembered devices by itself, so it
+      // may come straight back if the peer is still around.
+      Serial.println("[BT] Disconnect requested.");
+      bt.disconnect();
+    }
+    else
+    {
+      playNext();
+    }
+  }
+}
+
 void loopSerialCommands()
 {
   if (Serial.available())
@@ -397,13 +414,18 @@ void loopSerialCommands()
     {
       if (cmd == "state")
       {
-        String track = FileSystem::tracks.empty() ? "-" : FileSystem::tracks[0].name;
-        Serial.printf("[STATE] bt=%s/%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
-                      btEnabled ? "ON" : "OFF", bt.connected() ? "UP" : "DOWN",
+        String track = "-";
+        if (!FileSystem::tracks.empty() && currentTrack < FileSystem::tracks.size())
+          track = FileSystem::tracks[currentTrack].name;
+        Serial.printf("[STATE] view=%s bt=%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
+                      viewName(view), bt.connected() ? "UP" : "DOWN",
                       bt.peerName().c_str(),
                       (int)bt.connectPending(), (unsigned)bt.seenDeviceCount(),
                       (unsigned)bt.linkedMacs().size(), selectedMac.c_str());
-        Serial.printf("[STATE] vol=%d track='%s'\n", player.volume(), track.c_str());
+        Serial.printf("[STATE] vol=%d track=%u/%u '%s' meta='%s - %s'\n",
+                      player.volume(), (unsigned)currentTrack,
+                      (unsigned)FileSystem::tracks.size(), track.c_str(),
+                      player.metaArtist().c_str(), player.metaTitle().c_str());
         for (const auto &m : bt.linkedMacs())
           Serial.printf("[STATE] table: %s\n", m.c_str());
         return;
@@ -413,6 +435,16 @@ void loopSerialCommands()
         Serial.printf("[FS] %u track(s):\n", (unsigned)FileSystem::tracks.size());
         for (size_t i = 0; i < FileSystem::tracks.size(); ++i)
           Serial.printf("[FS] %3u %s\n", (unsigned)i, FileSystem::tracks[i].path.c_str());
+        return;
+      }
+      if (cmd == "next")
+      {
+        playNext();
+        return;
+      }
+      if (cmd.startsWith("play "))
+      {
+        playFileAt((size_t)cmd.substring(5).toInt());
         return;
       }
       bt.sendCommand(cmd);
@@ -430,7 +462,6 @@ void setup()
   player.begin(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
   setupFileSystem();
   screen.message("Starting...", "Waiting for BT");
-  setupClickWheel();
   setupButtons();
   setupBluetooth();
 }
@@ -439,8 +470,8 @@ void loop()
 {
   player.update();
   bt.update();
-  loopClickWheel();
-  loopBtMenu();
+  loopAudio();
+  loopUi();
   loopDisplay();
   loopSerialCommands();
   vTaskDelay(1);
