@@ -1,5 +1,6 @@
 #include "filesystem.h"
 #include "pins.h"
+#include <algorithm>
 
 std::vector<Track> FileSystem::tracks;
 SPIClass FileSystem::sdSpi = SPIClass(HSPI);
@@ -40,6 +41,10 @@ void FileSystem::scan(const char *rootPath)
     return;
   }
   scanDirectory(root);
+  // Stable order (FAT readdir order is arbitrary): sort by name,
+  // case-insensitive, so indexes are predictable for picking.
+  std::sort(tracks.begin(), tracks.end(), [](const Track &a, const Track &b)
+            { return strcasecmp(a.name.c_str(), b.name.c_str()) < 0; });
 }
 
 void FileSystem::scanDirectory(File &dir, uint8_t depth)

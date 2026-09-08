@@ -84,11 +84,6 @@ void KcxController::sendCommand(const String &cmd)
   serial_.print(cmd + "\r\n");
 }
 
-void KcxController::requestVersion()
-{
-  sendCommand("AT+GMR?");
-}
-
 void KcxController::queryLinks()
 {
   sendCommand("AT+VMLINK?");
@@ -108,12 +103,6 @@ void KcxController::startScan()
   seen_.clear();
   connectPending_ = false;
   sendCommand("AT+PAIR");
-}
-
-void KcxController::clearPairings()
-{
-  sendCommand("AT+DELVMLINK");
-  delay(500);
 }
 
 void KcxController::disconnect()
@@ -153,12 +142,6 @@ size_t KcxController::pruneDevices(unsigned long maxAgeMs)
       ++it;
   }
   return before - seen_.size();
-}
-
-void KcxController::connectByName(const String &name)
-{
-  connectPending_ = true;
-  sendCommand("AT+ADDLINKNAME=" + name);
 }
 
 void KcxController::onDeviceFound(DeviceCallback cb)

@@ -20,6 +20,7 @@ public:
   void addWheelMotion(int delta);
 
   int volume() const { return volume_; }
+  const String &currentLabel() const { return currentLabel_; }
 
   // Services the decoder, applies pending volume, repeats on EOF.
   void update();

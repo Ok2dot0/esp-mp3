@@ -27,35 +27,55 @@ Screen screen;
 AudioPlayer player;
 
 // Pairing UI state: raw wheel motion, consumed by loopBtMenu().
-// When connected the wheel drives volume instead (see loop routing below).
+// When connected (or BT is off) the wheel drives volume instead.
 int wheelMotion = 0;
 String selectedMac;
 int listScrollRemainder = 0;
 
-// Debounced BOOT button (active LOW). Returns true once per press.
-bool bootButtonPressed()
+// Bluetooth master switch. Off = idle: link dropped, list UI hidden,
+// module left alone. Toggled with a long BOOT press.
+bool btEnabled = true;
+
+enum class BootPress
+{
+  None,
+  Short, // press + release
+  Long   // held >= 1.5 s
+};
+
+// Debounced BOOT button (active LOW). Poll every loop; each press
+// reports exactly once, on release (Short) or on hold timeout (Long).
+BootPress pollBootButton()
 {
   constexpr unsigned long kDebounceMs = 40;
+  constexpr unsigned long kLongMs = 1500;
   static bool lastLevel = HIGH;
-  static unsigned long lastChangeAt = 0;
-  static bool fired = false;
+  static unsigned long changeAt = 0;
+  static bool armed = false;
+  static bool longFired = false;
   bool level = digitalRead(Pins::BTN_BOOT);
+  unsigned long now = millis();
   if (level != lastLevel)
   {
     lastLevel = level;
-    lastChangeAt = millis();
+    changeAt = now;
   }
   if (level == HIGH)
   {
-    fired = false;
-    return false;
+    BootPress press = (armed && !longFired) ? BootPress::Short : BootPress::None;
+    armed = false;
+    longFired = false;
+    return press;
   }
-  if (!fired && millis() - lastChangeAt > kDebounceMs)
+  if (now - changeAt < kDebounceMs)
+    return BootPress::None;
+  armed = true;
+  if (!longFired && now - changeAt >= kLongMs)
   {
-    fired = true;
-    return true;
+    longFired = true;
+    return BootPress::Long;
   }
-  return false;
+  return BootPress::None;
 }
 
 void IRAM_ATTR clickWheelISR()
@@ -240,11 +260,12 @@ void loopClickWheel()
 
 void loopDisplay()
 {
-  // The device list owns the screen until something is connected.
-  if (!bt.connected())
+  // The device list owns the screen while pairing with BT on.
+  if (btEnabled && !bt.connected())
     return;
   String track = FileSystem::tracks.empty() ? "No tracks found." : FileSystem::tracks[0].name;
-  screen.show(track, player.volume(), bt.statusText());
+  String btline = bt.connected() ? bt.statusText() : String("BT: off");
+  screen.show(track, player.volume(), btline);
 }
 
 // Index of the selected device in the current scan results (-1 if none).
@@ -278,16 +299,37 @@ void setSelectedDevice(int index)
   }
 }
 
-// Pairing UI: scroll the scan list with the wheel, BOOT to connect.
-// While connected the wheel goes to volume and BOOT disconnects back
-// to the list.
+// Bluetooth UI: scroll the scan list with the wheel, short BOOT to
+// connect/disconnect, long BOOT to switch pairing on/off (idle).
+// The wheel drives volume while connected or while BT is off.
 void loopBtMenu()
 {
-  if (bt.connected())
+  bool linked = bt.connected();
+  if (!btEnabled || linked)
   {
     player.addWheelMotion(wheelMotion);
     wheelMotion = 0;
-    if (bootButtonPressed())
+  }
+
+  BootPress press = pollBootButton();
+  if (press == BootPress::Long)
+  {
+    btEnabled = !btEnabled;
+    if (!btEnabled)
+    {
+      Serial.println("[BTN] Long press: Bluetooth off (idle).");
+      bt.disconnect();
+    }
+    else
+    {
+      Serial.println("[BTN] Long press: Bluetooth on, scanning.");
+      bt.startScan();
+    }
+  }
+
+  if (linked)
+  {
+    if (press == BootPress::Short)
     {
       Serial.println("[BTN] BOOT pressed while connected.");
       // Note: the module re-links remembered devices by itself, so it
@@ -297,6 +339,9 @@ void loopBtMenu()
     }
     return;
   }
+
+  if (!btEnabled)
+    return; // Idle: screen stays on now-playing (see loopDisplay).
 
   const auto &devs = bt.seenDevices();
   // Forget devices gone quiet: the module re-reports visible ones about
@@ -322,7 +367,7 @@ void loopBtMenu()
     sel = selectedDeviceIndex();
   }
 
-  if (bootButtonPressed())
+  if (press == BootPress::Short)
   {
     if (sel >= 0)
     {
@@ -352,12 +397,22 @@ void loopSerialCommands()
     {
       if (cmd == "state")
       {
-        Serial.printf("[STATE] bt=%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
-                      bt.connected() ? "UP" : "DOWN", bt.peerName().c_str(),
+        String track = FileSystem::tracks.empty() ? "-" : FileSystem::tracks[0].name;
+        Serial.printf("[STATE] bt=%s/%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
+                      btEnabled ? "ON" : "OFF", bt.connected() ? "UP" : "DOWN",
+                      bt.peerName().c_str(),
                       (int)bt.connectPending(), (unsigned)bt.seenDeviceCount(),
                       (unsigned)bt.linkedMacs().size(), selectedMac.c_str());
+        Serial.printf("[STATE] vol=%d track='%s'\n", player.volume(), track.c_str());
         for (const auto &m : bt.linkedMacs())
           Serial.printf("[STATE] table: %s\n", m.c_str());
+        return;
+      }
+      if (cmd == "tracks")
+      {
+        Serial.printf("[FS] %u track(s):\n", (unsigned)FileSystem::tracks.size());
+        for (size_t i = 0; i < FileSystem::tracks.size(); ++i)
+          Serial.printf("[FS] %3u %s\n", (unsigned)i, FileSystem::tracks[i].path.c_str());
         return;
       }
       bt.sendCommand(cmd);

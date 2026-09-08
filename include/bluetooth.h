@@ -52,7 +52,6 @@ public:
   void pump(unsigned long ms);
 
   void sendCommand(const String &cmd);
-  void requestVersion();
   // Ask the module for its auto-link table (answers parsed into
   // linkedMacs()).
   void queryLinks();
@@ -68,9 +67,6 @@ public:
   // Store the device (unless known) and wait for the module to link it
   // on sight. No extra scan is kicked: the module scans continuously.
   void connectByMac(const String &rawMac);
-  void connectByName(const String &name);
-  // Forgets all auto-link pairings (module stops auto-reconnecting).
-  void clearPairings();
   // Drops scan entries not re-seen for maxAgeMs. Returns dropped count.
   // The module re-reports visible devices, so only gone ones vanish.
   size_t pruneDevices(unsigned long maxAgeMs);
