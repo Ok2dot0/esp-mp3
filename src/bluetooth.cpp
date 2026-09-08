@@ -268,6 +268,10 @@ void KcxController::rememberSighting(const String &name, const String &formatted
       return;
     }
   }
+  // Cap the list: a chattering module must never grow it (and the UI
+  // work per loop) without bound.
+  if (seen_.size() >= 25)
+    seen_.erase(seen_.begin());
   seen_.push_back({name, formattedMac, millis()});
 
   if (onDeviceFound_)
