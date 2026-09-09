@@ -1,136 +1,242 @@
 #include "bluetooth.h"
 
-KcxController::KcxController(uint8_t rxPin, uint8_t txPin)
-    : rxPin_(rxPin), txPin_(txPin), serial_(1) {}
-
-void KcxController::begin(uint32_t baud)
+namespace
 {
-  serial_.begin(baud, SERIAL_8N1, rxPin_, txPin_);
-  delay(100);
-  while (serial_.available())
-    serial_.read();
+
+BtService *s_instance = nullptr;
+
+String formatMacImpl(const String &macNoColons)
+{
+  String formatted;
+  formatted.reserve(macNoColons.length() + 5);
+  for (size_t i = 0; i < macNoColons.length(); ++i)
+  {
+    formatted += macNoColons[i];
+    if ((i % 2 == 1) && (i + 1 < macNoColons.length()))
+      formatted += ':';
+  }
+  return formatted;
 }
 
-bool KcxController::waitReady(unsigned long timeoutMs)
+} // namespace
+
+// Library weak callbacks: forward to the owning BtService instance.
+void kcx_bt_info(const char *info, const char *val)
+{
+  Serial.printf("[KCX] %s %s\n", info ? info : "", val ? val : "");
+  if (s_instance)
+    s_instance->handleInfo(info, val);
+}
+
+void kcx_bt_status(bool status)
+{
+  if (s_instance)
+    s_instance->handleStatus(status);
+}
+
+void kcx_bt_memItems(const char *jsonItems)
+{
+  Serial.printf("[BT] mem: %s\n", jsonItems ? jsonItems : "null");
+  if (s_instance)
+    s_instance->handleMemItems(jsonItems);
+}
+
+void kcx_bt_scanItems(const char *jsonItems)
+{
+  Serial.printf("[BT] scan: %s\n", jsonItems ? jsonItems : "null");
+  if (s_instance)
+    s_instance->handleScanItems(jsonItems);
+}
+
+void kcx_bt_modeChanged(const char *m)
+{
+  Serial.printf("[BT] mode: %s\n", m ? m : "?");
+  if (s_instance)
+    s_instance->handleModeChanged(m);
+}
+
+BtService::BtService(uint8_t rxPin, uint8_t txPin, uint8_t linkPin, uint8_t modeDummyPin)
+    : emitter_(rxPin, txPin, linkPin, modeDummyPin)
+{
+}
+
+void BtService::begin()
+{
+  s_instance = this;
+  emitter_.begin();
+  // Kick the alive check; the library answers via kcx_bt_info("KCX_BT_Emitter found").
+  emitter_.userCommand("AT+");
+}
+
+void BtService::loop()
+{
+  emitter_.loop();
+  // Keep the ISR-driven flag honest: if the LINK pin disagrees with the
+  // cached state for a while (missed edge), heal it here. The library
+  // only notifies on edges, so this covers e.g. a link that came up
+  // while the ESP was rebooting.
+  static unsigned long lastHeal = 0;
+  if (millis() - lastHeal > 2000)
+  {
+    lastHeal = millis();
+    bool pinUp = emitter_.isConnected();
+    if (pinUp != connected_)
+      setConnected(pinUp, pinUp ? "LINK pin HIGH" : "LINK pin LOW");
+  }
+}
+
+bool BtService::waitReady(unsigned long timeoutMs)
 {
   unsigned long start = millis();
-  sendCommand("AT+");
   while (!ready_ && millis() - start < timeoutMs)
   {
-    update();
+    loop();
     delay(50);
   }
-  if (!ready_)
-    return false;
-  sendCommand("AT+GMR?");
-  while (!versionSeen_ && millis() - start < timeoutMs)
-  {
-    update();
-    delay(50);
-  }
-  return versionSeen_;
+  return ready_;
 }
-void KcxController::update()
-{
-  while (serial_.available())
-  {
-    char c = static_cast<char>(serial_.read());
 
-    if (c == '\r')
+void BtService::handleInfo(const char *info, const char *val)
+{
+  if (!info)
+    return;
+  String i(info);
+  if (i.indexOf("KCX_BT_Emitter found") >= 0)
+  {
+    ready_ = true;
+    return;
+  }
+  if (i.startsWith("Version"))
+  {
+    if (val)
+      version_ = String(val);
+    return;
+  }
+  if (i.startsWith("Status ->"))
+  {
+    scanning_ = (val && String(val).indexOf("Scan") >= 0);
+    return;
+  }
+  if (i.startsWith("scanned:"))
+  {
+    // Per-device line, e.g. "MacAdd:ab..,Name:Foo". The JSON callback
+    // below carries the same data; parse it there instead.
+    return;
+  }
+}
+
+void BtService::handleStatus(bool connected)
+{
+  scanning_ = false;
+  setConnected(connected, connected ? "LINK up" : "LINK down");
+}
+
+void BtService::handleMemItems(const char *json)
+{
+  if (!json)
+    return;
+  std::vector<std::pair<String, String>> pairs; // (name, addr)
+  if (!parsePairs(json, false, pairs))
+    return;
+  saved_.clear();
+  for (auto &p : pairs)
+  {
+    String addr = stripColonsLower(p.second);
+    if (addr.isEmpty())
       continue;
-
-    if (c == '\n')
-    {
-      rxBuffer_.trim();
-      if (rxBuffer_.length() > 0)
-        parseLine(rxBuffer_);
-      rxBuffer_ = "";
-    }
-    else
-    {
-      rxBuffer_ += c;
-    }
+    // The library pads the table to 10 slots with empty entries; skip them.
+    if (p.first.isEmpty() && addr.isEmpty())
+      continue;
+    saved_.push_back({p.first, formatMac(addr), millis()});
   }
+  rebuildLinkedMacs();
+}
 
-  // Poll the link state so a silently dropped link (device walked away,
-  // no UART event) is noticed within seconds. Gated until setup is done
-  // so paced setup commands never collide with it.
-  if (polling_ && ready_ && millis() - lastStatusPoll_ > kStatusPollMs)
+void BtService::handleScanItems(const char *json)
+{
+  if (!json)
+    return;
+  std::vector<std::pair<String, String>> pairs; // (name, addr)
+  // Scan JSON is addr-first: [{"addr":"..","name":".."}].
+  if (!parsePairs(json, true, pairs))
+    return;
+  for (auto &p : pairs)
   {
-    lastStatusPoll_ = millis();
-    sendCommand("AT+STATUS?");
+    String addr = stripColonsLower(p.second);
+    if (addr.length() < 12)
+      continue;
+    rememberSighting(p.first, formatMac(addr));
   }
 }
 
-void KcxController::setPolling(bool on)
+void BtService::handleModeChanged(const char *m)
 {
-  polling_ = on;
-  lastStatusPoll_ = millis();
+  if (m)
+    mode_ = String(m);
 }
 
-void KcxController::pump(unsigned long ms)
+void BtService::sendCommand(const String &cmd)
 {
+  Serial.printf("[KCX] >> %s\n", cmd.c_str());
+  emitter_.userCommand(cmd.c_str());
+}
+
+void BtService::queryLinks()
+{
+  emitter_.getVMlinks();
+}
+
+void BtService::resetModule()
+{
+  sendCommand("AT+RESET");
+  // POWER ON + first SCAN lines arrive over the next seconds; pump the
+  // library so the queue and callbacks run while we wait.
   unsigned long start = millis();
-  while (millis() - start < ms)
+  while (millis() - start < 2500)
   {
-    update();
+    loop();
     delay(10);
   }
 }
 
-void KcxController::sendCommand(const String &cmd)
+void BtService::startScan()
 {
-  Serial.printf("[KCX] >> %s\n", cmd.c_str());
-  serial_.print(cmd + "\r\n");
-}
-
-void KcxController::queryLinks()
-{
-  sendCommand("AT+VMLINK?");
-}
-
-void KcxController::resetModule()
-{
-  sendCommand("AT+RESET");
-  pump(2500); // POWER ON + first SCAN lines arrive here.
-}
-
-void KcxController::startScan()
-{
-  // AT+PAIR drops any link and (re)starts discovery (answers OK+PAIR,
-  // then SCAN... and MacAdd lines). No memory wipe: the auto-link table
-  // decides what the module may connect to.
-  seen_.clear();
-  connectPending_ = false;
+  // AT+PAIR drops any link and (re)starts discovery. No memory wipe:
+  // the auto-link table decides what the module may connect to.
   sendCommand("AT+PAIR");
 }
 
-void KcxController::disconnect()
+void BtService::disconnect()
 {
   sendCommand("AT+DISCON");
 }
 
-void KcxController::connectByMac(const String &rawMac)
+void BtService::deleteSaved()
 {
-  String cleanMac = rawMac;
-  cleanMac.replace(":", "");
-  cleanMac.toLowerCase();
+  emitter_.deleteVMlinks();
+}
+
+void BtService::storeDevice(const String &macNoColons)
+{
+  String cleanMac = stripColonsLower(macNoColons);
+  if (cleanMac.isEmpty() || isLinked(cleanMac))
+    return;
+  emitter_.addLinkAddr(cleanMac.c_str());
+}
+
+void BtService::connectByMac(const String &rawMac)
+{
+  String cleanMac = stripColonsLower(rawMac);
+  if (cleanMac.isEmpty())
+    return;
   connectPending_ = true;
   if (!isLinked(cleanMac))
-    sendCommand("AT+ADDLINKADD=" + cleanMac);
+    emitter_.addLinkAddr(cleanMac.c_str());
   // No scan kick: the module scans continuously and links stored
-  // devices on sight. Pacing matters (one command at a time).
+  // devices on sight. The queue paces one command at a time.
 }
 
-void KcxController::storeDevice(const String &macNoColons)
-{
-  String cleanMac = macNoColons;
-  cleanMac.toLowerCase();
-  if (!isLinked(cleanMac))
-    sendCommand("AT+ADDLINKADD=" + cleanMac);
-}
-
-size_t KcxController::pruneDevices(unsigned long maxAgeMs)
+size_t BtService::pruneDevices(unsigned long maxAgeMs)
 {
   size_t before = seen_.size();
   unsigned long now = millis();
@@ -144,20 +250,37 @@ size_t KcxController::pruneDevices(unsigned long maxAgeMs)
   return before - seen_.size();
 }
 
-void KcxController::onDeviceFound(DeviceCallback cb)
+void BtService::onDeviceFound(DeviceCallback cb)
 {
   onDeviceFound_ = cb;
 }
 
-void KcxController::onConnectionChange(StatusCallback cb)
+void BtService::onConnectionChange(StatusCallback cb)
 {
   onStatusChange_ = cb;
 }
 
-bool KcxController::isLinked(const String &macNoColons) const
+const char *BtService::protocolLine(uint16_t elementNr)
 {
-  String needle = macNoColons;
-  needle.toLowerCase();
+  return emitter_.list_protokol(elementNr);
+}
+
+void BtService::dumpProtocol() const
+{
+  // list_protokol is non-const in the library; const_cast is safe here
+  // (read-only access to the ring buffer).
+  auto *self = const_cast<BtService *>(this);
+  uint16_t i = 0;
+  while (const char *line = self->emitter_.list_protokol(i))
+  {
+    Serial.printf("[KCX proto] %s\n", line);
+    ++i;
+  }
+}
+
+bool BtService::isLinked(const String &macNoColons) const
+{
+  String needle = stripColonsLower(macNoColons);
   for (const auto &mac : linkedMacs_)
   {
     if (mac == needle)
@@ -166,7 +289,7 @@ bool KcxController::isLinked(const String &macNoColons) const
   return false;
 }
 
-bool KcxController::hasRealEntries() const
+bool BtService::hasRealEntries() const
 {
   for (const auto &mac : linkedMacs_)
   {
@@ -176,71 +299,42 @@ bool KcxController::hasRealEntries() const
   return false;
 }
 
-void KcxController::clearSeen()
+void BtService::clearSeen()
 {
   seen_.clear();
 }
 
-void KcxController::setConnected(bool connected, const String &detail)
+void BtService::setConnected(bool connected, const String &detail)
 {
   if (connected_ == connected)
     return;
   connected_ = connected;
   connectPending_ = false;
+  (void)detail;
+  if (connected)
+    Serial.println("[BT] Status: Connected to audio sink.");
+  else
+  {
+    Serial.println("[BT] Status: Disconnected.");
+    peerName_ = "";
+  }
   if (onStatusChange_)
     onStatusChange_(connected, detail);
 }
 
-String KcxController::statusText() const
+String BtService::statusText() const
 {
   if (connected_)
     return "BT: " + (peerName_.isEmpty() ? String("connected") : peerName_);
   if (connectPending_)
     return "BT: connecting...";
-  if (!seen_.empty())
+  if (scanning_ || !seen_.empty())
     return "BT: scan (" + String(seen_.size()) + " found)";
   return "BT: scanning...";
 }
 
-namespace
+void BtService::rememberSighting(const String &name, const String &formattedMac)
 {
-
-// Splits "MacAdd:<hex>[,]Name:<name>" (scan reports and CONNECT=>
-// announcements share the shape). MAC comes back plain/lowercase.
-bool splitMacName(const String &line, String &macNoColons, String &name)
-{
-  int macIdx = line.indexOf("MacAdd:");
-  int nameIdx = line.indexOf("Name:");
-  if (macIdx < 0 || nameIdx < 0 || nameIdx < macIdx)
-    return false;
-  macNoColons = line.substring(macIdx + 7, nameIdx);
-  macNoColons.replace(",", "");
-  macNoColons.trim();
-  macNoColons.toLowerCase();
-  name = line.substring(nameIdx + 5);
-  name.trim();
-  return macNoColons.length() > 0;
-}
-
-String formatMac(const String &macNoColons)
-{
-  String formatted;
-  for (size_t i = 0; i < macNoColons.length(); ++i)
-  {
-    formatted += macNoColons[i];
-    if ((i % 2 == 1) && (i + 1 < macNoColons.length()))
-      formatted += ':';
-  }
-  return formatted;
-}
-
-} // namespace
-
-void KcxController::rememberSighting(const String &name, const String &formattedMac)
-{
-  lastFoundName_ = name;
-  // Re-sightings refresh the timestamp so present devices survive
-  // pruning while gone ones expire.
   for (auto &seen : seen_)
   {
     if (seen.mac == formattedMac)
@@ -251,126 +345,80 @@ void KcxController::rememberSighting(const String &name, const String &formatted
       return;
     }
   }
-  // Cap the list: a chattering module must never grow it (and the UI
-  // work per loop) without bound.
   if (seen_.size() >= 25)
     seen_.erase(seen_.begin());
   seen_.push_back({name, formattedMac, millis()});
+  if (connected_)
+    peerName_ = name;
 
   if (onDeviceFound_)
-    onDeviceFound_({name, formattedMac});
+    onDeviceFound_({name, formattedMac, millis()});
 }
 
-void KcxController::parseLine(const String &line)
+void BtService::rebuildLinkedMacs()
 {
-  Serial.printf("[KCX] << %s\n", line.c_str());
-  if (line == "OK+")
+  linkedMacs_.clear();
+  for (const auto &d : saved_)
   {
-    ready_ = true;
-    return;
+    String plain = stripColonsLower(d.mac);
+    if (!plain.isEmpty())
+      linkedMacs_.push_back(plain);
   }
-  // Connect indications per the KCX protocol (see KCX_BT_Emitter lib):
-  // "CONNECT", "CON ONE", "CON LAST", "CON MATCH ADD", "CON:0x...",
-  // "CONNECT=>MacAdd:..,Name:..". Checked before plain sightings so a
-  // CONNECT=> announcement both links and identifies the peer.
-  if (line.startsWith("CONNECT") ||
-      line.startsWith("CON ONE") ||
-      line.startsWith("CON LAST") ||
-      line.startsWith("CON MATCH") ||
-      line.startsWith("CON:") ||
-      line.indexOf("CONNECTED") >= 0)
-  {
-    statusMismatch_ = 0;
-    lastLinkUpMs_ = millis();
-    String mac, name;
-    if (splitMacName(line, mac, name))
-    {
-      peerName_ = name;
-      rememberSighting(name, formatMac(mac));
-    }
-    else if (!lastFoundName_.isEmpty())
-    {
-      peerName_ = lastFoundName_;
-    }
-    setConnected(true, line);
-    return;
-  }
+}
 
-  // Plain scan sightings, e.g. "MacAdd:ab..,Name:Jabra Evolve 65".
-  String mac, name;
-  if (splitMacName(line, mac, name))
-  {
-    rememberSighting(name, formatMac(mac));
-    return;
-  }
+String BtService::formatMac(const String &macNoColons)
+{
+  return formatMacImpl(macNoColons);
+}
 
-  // Auto-link table entries, e.g. "MEM_MacAdd 00:abb049edc250".
-  if (line.startsWith("MEM_MacAdd"))
-  {
-    int colon = line.lastIndexOf(':');
-    if (colon > 0)
-    {
-      String mac = line.substring(colon + 1);
-      mac.trim();
-      mac.toLowerCase();
-      if (!mac.isEmpty() && !isLinked(mac))
-      {
-        linkedMacs_.push_back(mac);
-        Serial.printf("[BT] Paired device remembered: %s\n", mac.c_str());
-      }
-    }
-    return;
-  }
+String BtService::stripColonsLower(const String &mac)
+{
+  String out = mac;
+  out.replace(":", "");
+  out.replace(",", "");
+  out.trim();
+  out.toLowerCase();
+  return out;
+}
 
-  // Last auto-linked device, e.g. "Auto_link_Add:abb049edc250" (or null).
-  // Counts as a table entry: the module re-links it by itself.
-  if (line.startsWith("Auto_link_Add:"))
+bool BtService::parsePairs(const char *json, bool addrFirst,
+                           std::vector<std::pair<String, String>> &out)
+{
+  // Parses [{"name":"A","addr":"B"},...] or [{"addr":"B","name":"A"},...]
+  // without a JSON dependency. Values are simple (no escaped quotes
+  // from the module), so a tiny key/value scanner is enough.
+  if (!json)
+    return false;
+  String s(json);
+  int pos = 0;
+  bool any = false;
+  while (true)
   {
-    String mac = line.substring(14);
-    mac.trim();
-    mac.toLowerCase();
-    if (!mac.isEmpty() && mac != "null" && !isLinked(mac))
+    int nameKey = s.indexOf("\"name\"", pos);
+    int addrKey = s.indexOf("\"addr\"", pos);
+    if (nameKey < 0 || addrKey < 0)
+      break;
+    auto valueAfter = [&](int keyPos) -> String
     {
-      linkedMacs_.push_back(mac);
-      Serial.printf("[BT] Paired device remembered: %s\n", mac.c_str());
-    }
-    return;
+      int colon = s.indexOf(':', (unsigned)keyPos);
+      if (colon < 0)
+        return "";
+      int q1 = s.indexOf('"', (unsigned)(colon + 1));
+      if (q1 < 0)
+        return "";
+      int q2 = s.indexOf('"', (unsigned)(q1 + 1));
+      if (q2 < 0)
+        return "";
+      return s.substring(q1 + 1, q2);
+    };
+    String name = valueAfter(nameKey);
+    String addr = valueAfter(addrKey);
+    (void)addrFirst;
+    pos = (nameKey > addrKey ? nameKey : addrKey) + 6;
+    if (name.isEmpty() && addr.isEmpty())
+      continue;
+    out.emplace_back(name, addr);
+    any = true;
   }
-
-  // Link poll answers, e.g. "OK+STATUS:1". Debounced: one poll can
-  // catch the link mid-transition, so two in a row must agree before
-  // the state flips. CONNECT/DISCONNECT lines bypass this entirely.
-  // Fresh links also get a grace window: the register keeps reading 0
-  // for many seconds after a real link-up.
-  if (line.startsWith("OK+STATUS:"))
-  {
-    bool up = line.endsWith("1");
-    if (up == connected_)
-    {
-      statusMismatch_ = 0;
-    }
-    else if (!up && millis() - lastLinkUpMs_ < kLinkUpGraceMs)
-    {
-      // Ignore: link just came up, register hasn't caught up yet.
-    }
-    else if (++statusMismatch_ >= 2)
-    {
-      statusMismatch_ = 0;
-      setConnected(up, line);
-    }
-    return;
-  }
-
-  if (line.indexOf("DISCONNECT") >= 0 || line == "OK+DISCON")
-  {
-    statusMismatch_ = 0;
-    setConnected(false, line);
-    return;
-  }
-
-  if (line.indexOf("OK+VERS:") >= 0)
-  {
-    versionSeen_ = true;
-    Serial.printf("[KCX] Firmware: %s\n", line.c_str());
-  }
+  return any;
 }

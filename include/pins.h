@@ -11,9 +11,19 @@ namespace Pins
   constexpr uint8_t SD_MOSI = 3;
   constexpr uint8_t SD_CS = 10;
 
-  // KCX BT emitter module (UART).
+  // KCX BT emitter module (UART + LINK status).
+  // UART crosses over: ESP RX <- KCX TX, ESP TX -> KCX RX. The
+  // ESP32-KCX-BT-EMITTER library hardcodes Serial2 for this pair.
   constexpr uint8_t KCX_RX = 14;
   constexpr uint8_t KCX_TX = 17;
+  // LINK: KCX LINK/LED pin, HIGH while a BT link is up. Wired, uses the
+  // library's CHANGE interrupt (replaces the old AT+STATUS? polling).
+  constexpr uint8_t KCX_LINK = 11;
+  // MODE: intentionally NOT wired (module stays in TX/emitter mode).
+  // The library refuses to init with a -1 pin, so this is a spare GPIO
+  // used as a dummy output and left physically unconnected. Never call
+  // setMode()/changeMode() (they drive this pin + RESET the module).
+  constexpr uint8_t KCX_MODE_DUMMY = 12;
 
   // I2S DAC.
   constexpr uint8_t DAC_BCK = 6;

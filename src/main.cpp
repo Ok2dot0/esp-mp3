@@ -3,8 +3,8 @@
 // Modules (see include/ + src/):
 //   pins         - central pin map
 //   filesystem   - SD card + audio file discovery
-//   bluetooth    - KCX BT emitter driver + connection state
-//   display      - LCD screens (player, browser, bluetooth)
+//   bluetooth    - BtService adapter over ESP32-KCX-BT-EMITTER + state
+//   display      - LCD screens (player, browser, bluetooth saved+found)
 //   audio_player - I2S playback, volume, metadata
 //
 // Input is the BOOT button only (short/long press); the click wheel
@@ -21,7 +21,7 @@
 namespace
 {
 
-KcxController bt(Pins::KCX_RX, Pins::KCX_TX);
+KcxController bt(Pins::KCX_RX, Pins::KCX_TX, Pins::KCX_LINK, Pins::KCX_MODE_DUMMY);
 Screen screen;
 AudioPlayer player;
 
@@ -124,7 +124,20 @@ void setupFileSystem()
 }
 
 void setupBluetooth()
-{  bt.onDeviceFound([](const BtDevice &dev)
+{
+  // Pumps the library for ms milliseconds so queued commands and their
+  // multi-line answers run to completion (one command at a time).
+  auto pump = [](unsigned long ms)
+  {
+    unsigned long start = millis();
+    while (millis() - start < ms)
+    {
+      bt.loop();
+      delay(10);
+    }
+  };
+
+  bt.onDeviceFound([](const BtDevice &dev)
   {
     // Listed on screen; the user picks what to connect (see loopBtMenu).
     Serial.printf("[BT] Found: %-25s | MAC: %s\n", dev.name.c_str(), dev.mac.c_str());
@@ -154,39 +167,43 @@ void setupBluetooth()
     Serial.println("[BT] Module ready.");
   else
     Serial.println("[BT] Module not answering, continuing anyway.");
+  bt.sendCommand("AT+GMR?");
+  bt.sendCommand("AT+BT_MODE?");
   // Pairings persist in module flash across ESP reboots on purpose:
   // the module holds (and re-links) remembered devices by itself.
   // Only a factory-fresh, empty table gets the sentinel so it cannot
   // grab the first device found before the user picks anything.
-  // Pacing matters throughout: the module handles one command at a time.
+  // Pacing matters throughout: the library queues one command at a time.
   bt.queryLinks();
-  bt.pump(1000);
-  if (bt.linkedMacs().empty())
+  pump(1500);
+  // The mem JSON callback may need one more round trip on slow boots.
+  if (bt.savedDevices().empty())
+  {
+    bt.queryLinks();
+    pump(1000);
+  }
+  if (bt.savedDevices().empty())
   {
     Serial.println("[BT] Table empty, storing sentinel guard.");
     bt.storeDevice(KcxController::kSentinelMac);
-    bt.pump(600);
+    pump(600);
+    bt.queryLinks();
+    pump(1000);
   }
   else
   {
-    Serial.printf("[BT] Table holds %u device(s).\n", (unsigned)bt.linkedMacs().size());
+    Serial.printf("[BT] Table holds %u device(s).\n", (unsigned)bt.savedDevices().size());
   }
   // Sync with a link the module may still hold (an ESP reboot does not
-  // drop it): two paced polls let the debounce heal the flag.
-  bt.sendCommand("AT+STATUS?");
-  bt.pump(400);
-  bt.sendCommand("AT+STATUS?");
-  bt.pump(400);
+  // drop it): the LINK pin heals the flag in bt.loop() within ~2 s.
+  pump(2500);
   if (!bt.connected() && bt.hasRealEntries())
   {
     // Down but remembered devices exist: reboot the module so IT
     // fast-relinks them without pairing mode, then re-sync.
     Serial.println("[BT] Rebooting module to trigger relink...");
     bt.resetModule();
-    bt.sendCommand("AT+STATUS?");
-    bt.pump(400);
-    bt.sendCommand("AT+STATUS?");
-    bt.pump(400);
+    pump(1500);
   }
   // Rescan only when actually down, never blindly: the module keeps
   // scanning and its auto-link state on its own.
@@ -199,7 +216,6 @@ void setupBluetooth()
   {
     Serial.println("[BT] Link still up, skipping rescan.");
   }
-  bt.setPolling(true);
 }
 
 // Playlist: play index (wraps), advance on EOF via takeRepeat().
@@ -267,13 +283,49 @@ void loopDisplay()
   screen.showPlayer(title, player.metaArtist(), player.volume(), btline);
 }
 
-// Index of the selected device in the current scan results (-1 if none).
+// Combined saved-then-scanned list backing the BT view. Saved entries
+// stay visible even when out of range (the module links them on sight);
+// scanned entries skip dupes of saved ones and the sentinel guard.
+void combinedBtList(std::vector<BtDevice> &out)
+{
+  out.clear();
+  auto plainOf = [](const String &mac)
+  {
+    String p = mac;
+    p.replace(":", "");
+    p.toLowerCase();
+    return p;
+  };
+  for (const auto &d : bt.savedDevices())
+  {
+    if (plainOf(d.mac) == "deadbeefcafe")
+      continue;
+    out.push_back(d);
+  }
+  for (const auto &d : bt.seenDevices())
+  {
+    bool dupe = false;
+    for (const auto &s : bt.savedDevices())
+    {
+      if (plainOf(s.mac) == plainOf(d.mac))
+      {
+        dupe = true;
+        break;
+      }
+    }
+    if (!dupe)
+      out.push_back(d);
+  }
+}
+
+// Index of the selected device in the combined list (-1 if none).
 int selectedDeviceIndex()
 {
-  const auto &devs = bt.seenDevices();
-  for (size_t i = 0; i < devs.size(); ++i)
+  std::vector<BtDevice> all;
+  combinedBtList(all);
+  for (size_t i = 0; i < all.size(); ++i)
   {
-    if (devs[i].mac == selectedMac)
+    if (all[i].mac == selectedMac)
       return (int)i;
   }
   return -1;
@@ -281,20 +333,21 @@ int selectedDeviceIndex()
 
 void setSelectedDevice(int index)
 {
-  const auto &devs = bt.seenDevices();
-  if (devs.empty())
+  std::vector<BtDevice> all;
+  combinedBtList(all);
+  if (all.empty())
   {
     selectedMac = "";
     return;
   }
   if (index < 0)
     index = 0;
-  if (index >= (int)devs.size())
-    index = (int)devs.size() - 1;
-  if (devs[(size_t)index].mac != selectedMac)
+  if (index >= (int)all.size())
+    index = (int)all.size() - 1;
+  if (all[(size_t)index].mac != selectedMac)
   {
-    selectedMac = devs[(size_t)index].mac;
-    Serial.printf("[BT] Selected: %s\n", devs[(size_t)index].name.c_str());
+    selectedMac = all[(size_t)index].mac;
+    Serial.printf("[BT] Selected: %s\n", all[(size_t)index].name.c_str());
   }
 }
 
@@ -304,27 +357,30 @@ void loopBtMenu(BootPress press)
   if (bt.connected())
     return; // Link owns the view; now-playing shows the peer name.
 
-  const auto &devs = bt.seenDevices();
-  // Forget devices gone quiet: the module re-reports visible ones about
-  // every ~15-20 s, so only switched-off/out-of-range entries vanish
-  // (no ghosts). Margin kept wide so the selection never flickers.
+  // Forget devices gone quiet: the module re-reports visible ones, so
+  // only switched-off/out-of-range entries vanish (no ghosts). Margin
+  // kept wide so the selection never flickers.
   size_t dropped = bt.pruneDevices(30000);
   if (dropped > 0)
     Serial.printf("[BT] Forgot %u stale device(s).\n", (unsigned)dropped);
+  std::vector<BtDevice> all;
+  combinedBtList(all);
   int sel = selectedDeviceIndex();
   if (sel < 0)
     sel = 0;
   setSelectedDevice(sel);
   sel = selectedDeviceIndex();
+  // Rebuild after setSelectedDevice clamped the cursor.
+  combinedBtList(all);
 
   if (press == BootPress::Short)
   {
-    if (sel >= 0)
+    if (sel >= 0 && (size_t)sel < all.size())
     {
       Serial.printf("[BTN] BOOT pressed, sel=%d.\n", sel);
       Serial.printf("[BT] Connecting to %s (%s)...\n",
-                    devs[(size_t)sel].name.c_str(), devs[(size_t)sel].mac.c_str());
-      bt.connectByMac(devs[(size_t)sel].mac);
+                    all[(size_t)sel].name.c_str(), all[(size_t)sel].mac.c_str());
+      bt.connectByMac(all[(size_t)sel].mac);
     }
     else
     {
@@ -334,7 +390,8 @@ void loopBtMenu(BootPress press)
     }
   }
 
-  screen.showDevices(devs, sel, bt.statusText(), bt.linkedMacs());
+  screen.showBt(bt.savedDevices(), bt.seenDevices(), sel,
+                bt.statusText(), bt.connected(), bt.peerName());
 }
 
 // Track browser view: SHORT plays the cursor and steps it forward,
@@ -417,11 +474,12 @@ void loopSerialCommands()
         String track = "-";
         if (!FileSystem::tracks.empty() && currentTrack < FileSystem::tracks.size())
           track = FileSystem::tracks[currentTrack].name;
-        Serial.printf("[STATE] view=%s bt=%s peer='%s' pending=%d seen=%u linked=%u sel='%s'\n",
+        Serial.printf("[STATE] view=%s bt=%s peer='%s' pending=%d seen=%u saved=%u sel='%s' mode=%s ver=%s\n",
                       viewName(view), bt.connected() ? "UP" : "DOWN",
                       bt.peerName().c_str(),
                       (int)bt.connectPending(), (unsigned)bt.seenDeviceCount(),
-                      (unsigned)bt.linkedMacs().size(), selectedMac.c_str());
+                      (unsigned)bt.savedDevices().size(), selectedMac.c_str(),
+                      bt.mode().c_str(), bt.version().c_str());
         Serial.printf("[STATE] vol=%d track=%u/%u '%s' meta='%s - %s'\n",
                       player.volume(), (unsigned)currentTrack,
                       (unsigned)FileSystem::tracks.size(), track.c_str(),
@@ -447,6 +505,21 @@ void loopSerialCommands()
         playFileAt((size_t)cmd.substring(5).toInt());
         return;
       }
+      if (cmd == "btp")
+      {
+        bt.dumpProtocol();
+        return;
+      }
+      if (cmd == "btmem")
+      {
+        bt.queryLinks();
+        return;
+      }
+      if (cmd == "btdel")
+      {
+        bt.deleteSaved();
+        return;
+      }
       bt.sendCommand(cmd);
     }
   }
@@ -469,7 +542,7 @@ void setup()
 void loop()
 {
   player.update();
-  bt.update();
+  bt.loop();
   loopAudio();
   loopUi();
   loopDisplay();

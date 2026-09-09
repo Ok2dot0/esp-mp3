@@ -4,24 +4,28 @@
 #include <functional>
 #include <vector>
 
+#include "KCX_BT_Emitter.h"
+
 struct BtDevice
 {
   String name;
   String mac; // Formatted with colons, e.g. "ab:b0:49:ed:c2:50".
-  unsigned long lastSeen = 0; // millis() of the last scan sighting.
+  unsigned long lastSeen = 0; // millis() of the last sighting.
 };
 
-// Driver for the KCX BT emitter module (AT commands over UART).
-// Link model (manufacturer manual + reference behavior):
-// - The module links table entries (MEM_MacAdd) on scan sightings.
-// - It fast-relinks the Auto_link_Add ("last connected") device,
-//   e.g. on its own boot, without pairing mode.
-// - It holds the link independently of the ESP32.
-// Consequences honored here: the table is never wiped (persist!),
-// Auto_link state is never disturbed (no blind rescans on drops),
-// and an ESP reboot syncs with the live state instead of tearing it
-// down. Tracks connection state so the UI can show it.
-class KcxController
+// Thin adapter over schreibfaul1/ESP32-KCX-BT-EMITTER.
+//
+// Link model (manufacturer manual + library behavior):
+// - The module links table entries on scan sightings and fast-relinks
+//   the last device on its own boot.
+// - Connection state comes from the LINK pin interrupt
+//   (kcx_bt_status), not AT+STATUS? polling.
+// - Scan results arrive as kcx_bt_scanItems JSON (last 3 sightings),
+//   saved table arrives as kcx_bt_memItems JSON (up to 10 entries).
+// - Empty table = module grabs the first device found, so a sentinel
+//   guard entry is stored on factory-fresh modules until the user
+//   picks something (see main.cpp setupBluetooth).
+class BtService
 {
 public:
   // Fake table entry that matches no real device. Stored only when the
@@ -32,37 +36,41 @@ public:
   using DeviceCallback = std::function<void(const BtDevice &)>;
   using StatusCallback = std::function<void(bool, const String &)>;
 
-  KcxController(uint8_t rxPin, uint8_t txPin);
+  BtService(uint8_t rxPin, uint8_t txPin, uint8_t linkPin, uint8_t modeDummyPin);
 
-  void begin(uint32_t baud = 115200);
-  // Pings the module until it answers OK+, then asks for its version.
-  // The module needs a few seconds after power-on before real commands
-  // work (early ones die silently or with CMD ERR), so boot waits here.
-  // Returns true once the module answered both.
+  void begin();
+  // Services the library (drains Serial2, runs the 1 s ticker jobs).
+  // Call every loop().
+  void loop();
+  // Block until the module answers OK+ (or timeout). Returns true when
+  // the library reported "KCX_BT_Emitter found".
   bool waitReady(unsigned long timeoutMs = 8000);
   bool ready() const { return ready_; }
-  // Pumps UART traffic; also polls link status every few seconds so a
-  // silently dropped link (headphones walked away) is noticed. The
-  // poll only runs after setPolling(true) (end of setup), so paced
-  // setup commands never collide with it.
-  void update();
-  void setPolling(bool on);
-  // Pump traffic for ms milliseconds (lets multi-line answers arrive
-  // before the next command: the module handles one command at a time).
-  void pump(unsigned long ms);
+
+  // Library callbacks land here (called from bluetooth.cpp weak fns).
+  void handleInfo(const char *info, const char *val);
+  void handleStatus(bool connected);
+  void handleMemItems(const char *json);
+  void handleScanItems(const char *json);
+  void handleModeChanged(const char *mode);
 
   void sendCommand(const String &cmd);
   // Ask the module for its auto-link table (answers parsed into
-  // linkedMacs()).
+  // savedDevices()/linkedMacs()).
   void queryLinks();
-  // Reboot the module (answers OK+RESET, POWER ON). On its boot it
-  // fast-relinks remembered devices without pairing mode.
+  // Reboot the module (POWER ON). On boot it fast-relinks remembered
+  // devices without pairing mode.
   void resetModule();
-  // Disconnect + rescan for devices.
+  // Ask the module to (re)start discovery. When disconnected the module
+  // scans by itself; this just kicks it after entering the BT view or
+  // when the list is empty.
   void startScan();
   void disconnect();
-  // Store the device in the module's auto-link table without asking it
-  // to link right now. No-op when already stored.
+  // Delete the whole auto-link table (the module has no single-entry
+  // delete). Caller should re-store the sentinel guard afterwards.
+  void deleteSaved();
+  // Store the device in the module's auto-link table. No-op when
+  // already stored. The module links it on sight by itself.
   void storeDevice(const String &macNoColons);
   // Store the device (unless known) and wait for the module to link it
   // on sight. No extra scan is kicked: the module scans continuously.
@@ -74,13 +82,24 @@ public:
   void onDeviceFound(DeviceCallback cb);
   void onConnectionChange(StatusCallback cb);
 
+  // Protocol log passthrough (last ~100 RX/TX lines). Returns nullptr
+  // when elementNr is out of range.
+  const char *protocolLine(uint16_t elementNr);
+  void dumpProtocol() const;
+
   // UI-facing state.
   bool connected() const { return connected_; }
   bool connectPending() const { return connectPending_; }
   const String &peerName() const { return peerName_; }
+  const String &mode() const { return mode_; }
+  const String &version() const { return version_; }
+  // Live scan sightings (accumulated from scan JSON, pruned by age).
   const std::vector<BtDevice> &seenDevices() const { return seen_; }
   size_t seenDeviceCount() const { return seen_.size(); }
-  // Auto-link table as plain hex MACs without colons.
+  // Saved auto-link table as full devices (name may be empty when the
+  // module only reported a MAC).
+  const std::vector<BtDevice> &savedDevices() const { return saved_; }
+  // Auto-link table as plain hex MACs without colons (compat helper).
   const std::vector<String> &linkedMacs() const { return linkedMacs_; }
   bool isLinked(const String &macNoColons) const;
   // True when the table holds anything but the sentinel: remembered
@@ -92,13 +111,9 @@ public:
   String statusText() const;
 
 private:
-  static constexpr unsigned long kStatusPollMs = 5000;
-
-  uint8_t rxPin_;
-  uint8_t txPin_;
-  HardwareSerial serial_;
-  String rxBuffer_;
+  KCX_BT_Emitter emitter_;
   std::vector<BtDevice> seen_;
+  std::vector<BtDevice> saved_;
   std::vector<String> linkedMacs_;
   DeviceCallback onDeviceFound_ = nullptr;
   StatusCallback onStatusChange_ = nullptr;
@@ -106,24 +121,22 @@ private:
   bool connected_ = false;
   bool connectPending_ = false;
   bool ready_ = false;
-  bool versionSeen_ = false;
-  bool polling_ = false;
-  // Consecutive disagreeing STATUS polls. A single poll can sample the
-  // link mid-transition (stale), so only repeated agreement flips the
-  // state. Real CONNECT/DISCONNECT lines always act immediately.
-  uint8_t statusMismatch_ = 0;
-  // millis() of the last event-driven link-up. STATUS:0 readings inside
-  // the grace window are ignored: the register lags a fresh link by
-  // many seconds and would otherwise flap the UI straight back down.
-  unsigned long lastLinkUpMs_ = 0;
-  static constexpr unsigned long kLinkUpGraceMs = 15000;
+  bool scanning_ = false;
   String peerName_;
-  String lastFoundName_;
-  unsigned long lastStatusPoll_ = 0;
+  String version_;
+  String mode_ = "TX";
 
-  void parseLine(const String &line);
   void setConnected(bool connected, const String &detail);
-  // Records a scan sighting (new or refresh); fires onDeviceFound once
-  // per previously unseen MAC.
   void rememberSighting(const String &name, const String &formattedMac);
+  void rebuildLinkedMacs();
+  static String formatMac(const String &macNoColons);
+  static String stripColonsLower(const String &mac);
+  // Very small JSON parser for the library's fixed shapes:
+  // [{"name":"..","addr":".."}, ...] and [{"addr":"..","name":".."}, ...].
+  // Returns false when nothing parseable was found.
+  bool parsePairs(const char *json, bool addrFirst,
+                  std::vector<std::pair<String, String>> &out);
 };
+
+// Compatibility alias so display.h/main.cpp keep readable names.
+using KcxController = BtService;

@@ -26,10 +26,21 @@ public:
   // change cache; the next show()/showDevices() repaints over it.
   void message(const String &line1, const String &line2 = "");
 
-  // Bluetooth pairing view: discovered devices with a highlighted
-  // selection, plus a status footer. knownMacs holds remembered (auto-
-  // link table) MACs without colons; those rows get a "*" marker.
-  // Same change-only repaint policy.
+  // Bluetooth view reworked for the ESP32-KCX-BT-EMITTER library model:
+  // - saved: auto-link table from kcx_bt_memItems (up to 10, persistent
+  //   in module flash; the module links these on sight by itself).
+  // - scanned: live sightings from kcx_bt_scanItems (last few seen).
+  // - selected: combined index over saved-then-scanned (0..N-1).
+  // - status: one-line link/scan state for the footer.
+  // - connected/peer: when up, the lists collapse to a peer banner.
+  // Same change-only repaint policy as the other views.
+  void showBt(const std::vector<BtDevice> &saved,
+              const std::vector<BtDevice> &scanned,
+              int selected, const String &status,
+              bool connected, const String &peer);
+
+  // Legacy wrapper: scanned-only list with known-table markers.
+  // Kept so old call sites still compile; new code uses showBt().
   void showDevices(const std::vector<BtDevice> &devices, int selected,
                    const String &footer, const std::vector<String> &knownMacs);
 
@@ -46,6 +57,10 @@ private:
                      const String &btStatus);
   void repaintTracks(const std::vector<String> &labels, int highlight,
                      const String &header);
+  void repaintBt(const std::vector<BtDevice> &saved,
+                 const std::vector<BtDevice> &scanned,
+                 int selected, const String &status,
+                 bool connected, const String &peer);
   void repaintDevices(const std::vector<BtDevice> &devices, int selected,
                       const String &footer, const std::vector<String> &knownMacs);
 };

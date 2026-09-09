@@ -197,6 +197,149 @@ void Screen::message(const String &line1, const String &line2)
   }
 }
 
+void Screen::showBt(const std::vector<BtDevice> &saved,
+                      const std::vector<BtDevice> &scanned,
+                      int selected, const String &status,
+                      bool connected, const String &peer)
+{
+  // Signature covers everything visible; unchanged screen = zero traffic.
+  String sig = String(selected) + "|" + status + "|" + (connected ? "1" : "0") + peer + "|";
+  for (const auto &d : saved)
+    sig += "S" + d.name + "," + d.mac + ";";
+  sig += "|";
+  for (const auto &d : scanned)
+    sig += "F" + d.name + "," + d.mac + ";";
+  if (sig == lastListSig_)
+    return;
+  lastListSig_ = sig;
+  // Invalidate the now-playing cache so switching views repaints.
+  lastTrack_ = "\x01";
+  repaintBt(saved, scanned, selected, status, connected, peer);
+}
+
+void Screen::repaintBt(const std::vector<BtDevice> &saved,
+                       const std::vector<BtDevice> &scanned,
+                       int selected, const String &status,
+                       bool connected, const String &peer)
+{
+  constexpr int kTop = 20;
+  constexpr int kRowH = 18;
+  lcd.fillRect(0, 0, lcd.width(), 240, TFT_BLACK);
+  lcd.setCursor(0, 0);
+  lcd.println("Bluetooth:");
+
+  if (connected)
+  {
+    lcd.setCursor(0, kTop);
+    lcd.println("Connected:");
+    lcd.setCursor(0, kTop + kRowH);
+    String who = peer.isEmpty() ? String("audio sink") : peer;
+    if (who.length() > 22)
+      who = who.substring(0, 22);
+    lcd.println(who);
+    lcd.setCursor(0, 200);
+    lcd.println(status);
+    lcd.setCursor(0, 220);
+    lcd.println("Boot:disconnect");
+    return;
+  }
+
+  // Build a combined saved-then-scanned row list, skipping the sentinel
+  // guard entry (not a real device) and scanned dupes of saved entries.
+  struct Row
+  {
+    String label;
+    bool isSaved;
+  };
+  std::vector<Row> rows;
+  auto plainOf = [](const String &mac)
+  {
+    String p = mac;
+    p.replace(":", "");
+    p.toLowerCase();
+    return p;
+  };
+  for (const auto &d : saved)
+  {
+    if (plainOf(d.mac) == "deadbeefcafe")
+      continue;
+    String label = d.name.isEmpty() ? d.mac : d.name;
+    if (label.length() > 20)
+      label = label.substring(0, 20);
+    rows.push_back({"* " + label, true});
+  }
+  size_t savedRows = rows.size();
+  for (const auto &d : scanned)
+  {
+    bool dupe = false;
+    for (const auto &s : saved)
+    {
+      if (plainOf(s.mac) == plainOf(d.mac))
+      {
+        dupe = true;
+        break;
+      }
+    }
+    if (dupe)
+      continue;
+    String label = d.name.isEmpty() ? d.mac : d.name;
+    if (label.length() > 22)
+      label = label.substring(0, 22);
+    rows.push_back({label, false});
+  }
+
+  if (rows.empty())
+  {
+    lcd.setCursor(0, kTop);
+    lcd.println("Scanning...");
+    lcd.setCursor(0, kTop + kRowH);
+    lcd.println("No devices yet");
+  }
+  else
+  {
+    int count = (int)rows.size();
+    int offset = 0;
+    if (selected >= kMaxRows)
+      offset = selected - kMaxRows + 1;
+    if (offset > count - kMaxRows)
+      offset = count - kMaxRows;
+    if (offset < 0)
+      offset = 0;
+    int shown = count - offset;
+    if (shown > kMaxRows)
+      shown = kMaxRows;
+    // Section header shows where the saved block ends.
+    lcd.setCursor(0, kTop - 2);
+    if (savedRows > 0)
+      lcd.printf("Saved %u / Found %u\n", (unsigned)savedRows, (unsigned)(rows.size() - savedRows));
+    else
+      lcd.printf("Found %u\n", (unsigned)rows.size());
+    for (int i = 0; i < shown; ++i)
+    {
+      int y = kTop + kRowH + i * kRowH;
+      const Row &r = rows[(size_t)(offset + i)];
+      if (offset + i == selected)
+      {
+        lcd.fillRect(0, (uint16_t)y, lcd.width(), (uint16_t)kRowH, TFT_YELLOW);
+        lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
+        lcd.setCursor(4, y + 1);
+        lcd.println(r.label);
+        lcd.setTextColor(TFT_YELLOW);
+      }
+      else
+      {
+        lcd.setCursor(4, y + 1);
+        lcd.println(r.label);
+      }
+    }
+  }
+
+  lcd.setCursor(0, 200);
+  lcd.println(status);
+  lcd.setCursor(0, 220);
+  lcd.println(rows.empty() ? "Boot:rescan" : "Boot:connect");
+}
+
 void Screen::showDevices(const std::vector<BtDevice> &devices, int selected,
                       const String &footer, const std::vector<String> &knownMacs)
 {
