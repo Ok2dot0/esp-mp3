@@ -21,6 +21,13 @@ public:
   void addWheelMotion(int delta);
 
   int volume() const { return volume_; }
+  void setVolume(int v) {
+    if (v < kMinVolume)
+      v = kMinVolume;
+    if (v > kMaxVolume)
+      v = kMaxVolume;
+    volume_ = v;
+  }
   const String &currentLabel() const { return currentLabel_; }
   // Vorbis/ID3 metadata of the current file (empty until heard).
   const String &metaTitle() const { return metaTitle_; }

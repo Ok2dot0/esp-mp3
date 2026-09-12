@@ -272,15 +272,12 @@ void enterView(View v)
 
 void loopDisplay()
 {
-  if (view == View::Bt && !bt.connected())
-    return; // Device list owns the screen (see loopBtMenu).
-  if (view == View::Tracks)
-    return; // Track browser owns the screen (see loopTracks).
   String title = player.metaTitle();
   if (title.isEmpty())
     title = FileSystem::tracks.empty() ? "No tracks found." : FileSystem::tracks[currentTrack].name;
   String btline = (!bt.connected() && view == View::Off) ? String("BT: off") : bt.statusText();
-  screen.showPlayer(title, player.metaArtist(), player.volume(), btline);
+  screen.showPlayer(title, player.metaArtist(), player.volume(), btline,
+                    player.metaAlbum(), true);
 }
 
 // Combined saved-then-scanned list backing the BT view. Saved entries
@@ -351,12 +348,34 @@ void setSelectedDevice(int index)
   }
 }
 
+// Touch/BOOT share one connect action: empty list rescans, else connects.
+void connectSelected()
+{
+  if (bt.connected())
+  {
+    Serial.println("[BT] Disconnect requested.");
+    bt.disconnect();
+    return;
+  }
+  std::vector<BtDevice> all;
+  combinedBtList(all);
+  int sel = selectedDeviceIndex();
+  if (sel >= 0 && (size_t)sel < all.size())
+  {
+    Serial.printf("[BT] Connecting to %s (%s)...\n",
+                  all[(size_t)sel].name.c_str(), all[(size_t)sel].mac.c_str());
+    bt.connectByMac(all[(size_t)sel].mac);
+  }
+  else
+  {
+    Serial.println("[BT] Empty list, rescanning.");
+    bt.startScan();
+  }
+}
+
 // Bluetooth view: SHORT connects (or rescans when empty).
 void loopBtMenu(BootPress press)
 {
-  if (bt.connected())
-    return; // Link owns the view; now-playing shows the peer name.
-
   // Forget devices gone quiet: the module re-reports visible ones, so
   // only switched-off/out-of-range entries vanish (no ghosts). Margin
   // kept wide so the selection never flickers.
@@ -373,22 +392,8 @@ void loopBtMenu(BootPress press)
   // Rebuild after setSelectedDevice clamped the cursor.
   combinedBtList(all);
 
-  if (press == BootPress::Short)
-  {
-    if (sel >= 0 && (size_t)sel < all.size())
-    {
-      Serial.printf("[BTN] BOOT pressed, sel=%d.\n", sel);
-      Serial.printf("[BT] Connecting to %s (%s)...\n",
-                    all[(size_t)sel].name.c_str(), all[(size_t)sel].mac.c_str());
-      bt.connectByMac(all[(size_t)sel].mac);
-    }
-    else
-    {
-      // Nothing to pick: kick a fresh scan instead of idling.
-      Serial.println("[BTN] BOOT pressed on empty list, rescanning.");
-      bt.startScan();
-    }
-  }
+  if (press == BootPress::Short && !bt.connected())
+    connectSelected();
 
   screen.showBt(bt.savedDevices(), bt.seenDevices(), sel,
                 bt.statusText(), bt.connected(), bt.peerName());
@@ -531,6 +536,24 @@ void setup()
 {
   setupSerial();
   screen.begin();
+  UiEvents ev;
+  ev.play = [] { playFileAt(currentTrack); };
+  ev.next = [] { playNext(); };
+  ev.prev = [] {
+    if (FileSystem::tracks.empty())
+      return;
+    playFileAt(currentTrack == 0 ? FileSystem::tracks.size() - 1 : currentTrack - 1);
+  };
+  ev.volume = [](int v) { player.setVolume(v); };
+  ev.pickTrack = [](int i) {
+    if (FileSystem::tracks.empty())
+      return;
+    playFileAt((size_t)i % FileSystem::tracks.size());
+    trackCursor = ((size_t)i + 1) % FileSystem::tracks.size();
+  };
+  ev.pickBt = [](int i) { setSelectedDevice(i); };
+  ev.btAction = [] { connectSelected(); };
+  screen.setEvents(ev);
   screen.message("Starting...", "Mounting SD");
   player.begin(Pins::DAC_BCK, Pins::DAC_WS, Pins::DAC_DIN);
   setupFileSystem();
@@ -545,7 +568,17 @@ void loop()
   bt.loop();
   loopAudio();
   loopUi();
+  if (view == View::Tracks)
+    loopTracks(BootPress::None);
+  if (view == View::Bt || !bt.connected())
+    loopBtMenu(BootPress::None);
+  else
+  {
+    std::vector<BtDevice> none;
+    screen.showBt(bt.savedDevices(), none, 0, bt.statusText(), true, bt.peerName());
+  }
   loopDisplay();
+  screen.tick();
   loopSerialCommands();
   vTaskDelay(1);
 }

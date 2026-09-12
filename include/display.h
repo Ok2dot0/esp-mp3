@@ -1,66 +1,45 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 #include <vector>
 #include "bluetooth.h"
 
-// Owns the ILI9341 LCD and paints the player UI.
-// Repaints only when content actually changes, so the screen never blinks.
-class Screen
-{
+// Touch actions the UI can raise. main.cpp wires these to playback/BT.
+struct UiEvents {
+  std::function<void()> play = nullptr;
+  std::function<void()> next = nullptr;
+  std::function<void()> prev = nullptr;
+  std::function<void(int)> volume = nullptr;
+  std::function<void(int)> pickTrack = nullptr;
+  std::function<void(int)> pickBt = nullptr;
+  std::function<void()> btAction = nullptr;
+};
+
+// Owns LCD + touch + LVGL. Same show* API as before, now pretty.
+// Only repaints on change, tick() pumps LVGL without blocking audio.
+class Screen {
 public:
   void begin();
+  void tick();
+  void setEvents(const UiEvents &ev) { ev_ = ev; }
+  const UiEvents &events() const { return ev_; }
+  void setBrightness(uint8_t b);
 
-  // Now-playing view with metadata: title big, artist second row.
-  // Any argument that did not change since the last call costs zero
-  // SPI traffic, so the screen never blinks.
   void showPlayer(const String &title, const String &artist, int volume,
-                  const String &btStatus);
-
-  // Track browser: window of labels with a highlighted cursor row.
-  // Labels carry their own markers (e.g. ">" for now playing).
+                  const String &btStatus, const String &album = "",
+                  bool playing = true);
   void showTracks(const std::vector<String> &labels, int highlight,
                   const String &header);
-
-  // Immediate one-shot message (boot progress etc.). Bypasses the
-  // change cache; the next show()/showDevices() repaints over it.
   void message(const String &line1, const String &line2 = "");
-
-  // Bluetooth view reworked for the ESP32-KCX-BT-EMITTER library model:
-  // - saved: auto-link table from kcx_bt_memItems (up to 10, persistent
-  //   in module flash; the module links these on sight by itself).
-  // - scanned: live sightings from kcx_bt_scanItems (last few seen).
-  // - selected: combined index over saved-then-scanned (0..N-1).
-  // - status: one-line link/scan state for the footer.
-  // - connected/peer: when up, the lists collapse to a peer banner.
-  // Same change-only repaint policy as the other views.
   void showBt(const std::vector<BtDevice> &saved,
-              const std::vector<BtDevice> &scanned,
-              int selected, const String &status,
-              bool connected, const String &peer);
-
-  // Legacy wrapper: scanned-only list with known-table markers.
-  // Kept so old call sites still compile; new code uses showBt().
+              const std::vector<BtDevice> &scanned, int selected,
+              const String &status, bool connected, const String &peer);
   void showDevices(const std::vector<BtDevice> &devices, int selected,
                    const String &footer, const std::vector<String> &knownMacs);
 
 private:
-  static constexpr int kMaxRows = 6;
-
-  String lastTrack_;
-  int lastVolume_ = -1;
-  String lastBt_;
-  String lastListSig_;
-  String lastTracksSig_;
-
-  void repaintPlayer(const String &title, const String &artist, int volume,
-                     const String &btStatus);
-  void repaintTracks(const std::vector<String> &labels, int highlight,
-                     const String &header);
-  void repaintBt(const std::vector<BtDevice> &saved,
-                 const std::vector<BtDevice> &scanned,
-                 int selected, const String &status,
-                 bool connected, const String &peer);
-  void repaintDevices(const std::vector<BtDevice> &devices, int selected,
-                      const String &footer, const std::vector<String> &knownMacs);
+  UiEvents ev_;
+  String lastPlayer_, lastTracks_, lastBt_;
+  unsigned long lastTick_ = 0;
 };
